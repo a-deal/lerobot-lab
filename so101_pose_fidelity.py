@@ -44,12 +44,14 @@ Read the functions in this order
 
 1. ``read_positions`` validates the six-joint hardware state.
 2. ``calculate_joint_targets`` calls the pure translator.
-3. ``calculate_targets`` preserves the temporary legacy interface.
-4. ``next_commands`` rate-limits one control step.
-5. ``approach_and_hold`` executes and measures one authorized pose.
-6. ``write_cycle_rows`` records the detailed evidence.
-7. ``move_home`` restores the common follower anchor.
-8. ``main`` connects those pieces into the complete operator-gated experiment.
+3. ``legacy_target_views`` and ``calculate_targets`` preserve the temporary
+   legacy interface.
+4. ``build_pose_preview`` makes the first downstream ``JointTarget`` consumer.
+5. ``next_commands`` rate-limits one control step.
+6. ``approach_and_hold`` executes and measures one authorized pose.
+7. ``write_cycle_rows`` records the detailed evidence.
+8. ``move_home`` restores the common follower anchor.
+9. ``main`` connects those pieces into the complete operator-gated experiment.
 """
 
 from __future__ import annotations
@@ -194,12 +196,30 @@ def calculate_joint_targets(
     Andrew implements the delegation in this exercise. The function must stay
     hardware-free and must not reshape the mapper's result.
     """
+
     return map_pose_relative(
-        leader_now = leader_captured,
-        leader_start = leader_baseline,
-        follower_home = HOME,
-        configuration = MAPPING_CONFIGURATION,
+        leader_now=leader_captured,
+        leader_start=leader_baseline,
+        follower_home=HOME,
+        configuration=MAPPING_CONFIGURATION,
     )
+
+
+def legacy_target_views(
+    targets: dict[str, JointTarget],
+) -> tuple[dict[str, float], dict[str, float], dict[str, bool]]:
+    """Split named target receipts into the harness's three legacy views.
+
+    This is a temporary compatibility helper. It contains no mapping math and
+    must disappear after preview, motion, logging, evaluation, and self-test
+    code all consume ``JointTarget`` objects directly.
+    """
+
+    raw = {joint: targets[joint].raw for joint in JOINTS}
+    bounded = {joint: targets[joint].bounded for joint in JOINTS}
+    clipped = {joint: targets[joint].saturated for joint in JOINTS}
+    return raw, bounded, clipped
+
 
 def calculate_targets(
     leader_captured: dict[str, float],
@@ -214,21 +234,48 @@ def calculate_targets(
     """
 
     targets = calculate_joint_targets(leader_captured, leader_baseline)
+    return legacy_target_views(targets)
 
-    raw = {
-        joint: targets[joint].raw
-        for joint in JOINTS
-    }
-    bounded = {
-        joint: targets[joint].bounded
-        for joint in JOINTS
-    }
-    clipped = {
-        joint: targets[joint].saturated
-        for joint in JOINTS
-    }
 
-    return raw, bounded, clipped
+def build_pose_preview(
+    *,
+    pose_name: str,
+    leader_captured: dict[str, float],
+    leader_baseline: dict[str, float],
+    targets: dict[str, JointTarget],
+) -> dict[str, Any]:
+    """Build the no-motion preview directly from named target receipts.
+
+    The preview is the operator's last software-only inspection surface before
+    authorizing movement. It must preserve the leader delta plus every target's
+    raw proposal, bounded value, and saturation decision. It may format data
+    for JSON, but it may not connect hardware or send commands.
+
+    This is the first production consumer to migrate away from the legacy
+    parallel dictionaries. Andrew implements its returned dictionary in this
+    exercise.
+    """
+
+    return {
+        "stage": "pose_preview_no_motion",
+        "pose": pose_name,
+        "leader_delta": {
+            joint: leader_captured[joint] - leader_baseline[joint]
+            for joint in JOINTS
+        },
+        "raw_target": {
+            joint: targets[joint].raw
+            for joint in JOINTS
+        },
+        "bounded_target": {
+            joint: targets[joint].bounded
+            for joint in JOINTS
+        },
+        "absolute_clipped": {
+            joint: targets[joint].saturated
+            for joint in JOINTS
+        },
+    }
 
 
 def next_commands(
@@ -645,22 +692,18 @@ def main() -> int:
                         "Press ENTER for a no-motion preview.\n"
                     )
                     leader_captured = read_positions(leader.bus)
-                    raw_targets, bounded_targets, absolute_clipped = calculate_targets(
-                        leader_captured, leader_baseline
+                    joint_targets = calculate_joint_targets(
+                        leader_captured,
+                        leader_baseline,
                     )
-                    preview = {
-                        "stage": "pose_preview_no_motion",
-                        "pose": pose_name,
-                        "leader_delta": {
-                            joint: leader_captured[joint] - leader_baseline[joint]
-                            for joint in JOINTS
-                        },
-                        "raw_target": raw_targets,
-                        "bounded_target": bounded_targets,
-                        "absolute_clipped": absolute_clipped,
-                    }
+                    preview = build_pose_preview(
+                        pose_name=pose_name,
+                        leader_captured=leader_captured,
+                        leader_baseline=leader_baseline,
+                        targets=joint_targets,
+                    )
                     print(json.dumps(preview, indent=2), flush=True)
-                    if any(absolute_clipped.values()):
+                    if any(target.saturated for target in joint_targets.values()):
                         print(
                             "Rejected: at least one target crossed an absolute margin. "
                             "Reposition the leader; no motion was sent.",
@@ -679,6 +722,10 @@ def main() -> int:
                         print("Expected MOVE, REDO, or QUIT.", flush=True)
                         continue
                     break
+
+                raw_targets, bounded_targets, absolute_clipped = legacy_target_views(
+                    joint_targets
+                )
 
                 commanded, pose_result = approach_and_hold(
                     follower=follower,
