@@ -14,6 +14,9 @@ test protects the temporary legacy interface: ``calculate_targets`` must
 unpack those receipts into ``raw``, ``bounded``, and ``clipped`` dictionaries.
 The third test protects the first migrated consumer: ``build_pose_preview``
 must expose every part of each named receipt before motion is authorized.
+The fourth test protects the receipt-to-CSV vocabulary. The fifth proves that
+the cycle logger passes every joint through that vocabulary rather than
+reconstructing three unrelated target dictionaries.
 
 ``patch`` temporarily substitutes a controllable mapper result. This isolates
 adapter wiring from mapping arithmetic. These tests never connect serial
@@ -28,7 +31,7 @@ from __future__ import annotations
 
 from typing import Literal
 import unittest
-from unittest.mock import patch
+from unittest.mock import Mock, patch
 
 from so101_mapping import JointTarget
 from so101_pose_fidelity import (
@@ -37,6 +40,8 @@ from so101_pose_fidelity import (
     build_pose_preview,
     calculate_joint_targets,
     calculate_targets,
+    target_log_fields,
+    write_cycle_rows,
 )
 
 
@@ -158,6 +163,60 @@ class MappingAdapterTests(unittest.TestCase):
             preview["absolute_clipped"],
             {joint: target.saturated for joint, target in targets.items()},
         )
+
+    def test_target_log_fields_preserves_one_receipt(self) -> None:
+        """CSV translation preserves both numbers and makes clipping binary."""
+
+        fields = target_log_fields(
+            JointTarget(raw=100.0, bounded=80.0, saturated=True)
+        )
+
+        self.assertEqual(
+            fields,
+            {
+                "raw_target": 100.0,
+                "bounded_target": 80.0,
+                "absolute_clipped": 1,
+            },
+        )
+
+    def test_cycle_logger_reads_target_receipts(self) -> None:
+        """Each logged joint gets its target evidence from one named receipt."""
+
+        writer = Mock()
+        zeros = {joint: 0.0 for joint in JOINTS}
+        false_by_joint = {joint: False for joint in JOINTS}
+        targets = {
+            joint: JointTarget(
+                raw=100.0 if joint == "gripper" else float(index),
+                bounded=95.0 if joint == "gripper" else float(index),
+                saturated=(joint == "gripper"),
+            )
+            for index, joint in enumerate(JOINTS, start=1)
+        }
+
+        write_cycle_rows(
+            writer,
+            process_start=0.0,
+            pose_name="far",
+            phase="approach",
+            cycle=1,
+            leader_baseline=zeros,
+            leader_captured=zeros,
+            leader_live=zeros,
+            joint_targets=targets,
+            commanded=zeros,
+            rate_limited=false_by_joint,
+            follower_measured=zeros,
+            cycle_duration_s=0.02,
+        )
+
+        self.assertEqual(writer.writerow.call_count, len(JOINTS))
+        rows = [call.args[0] for call in writer.writerow.call_args_list]
+        gripper_row = next(row for row in rows if row["joint"] == "gripper")
+        self.assertEqual(gripper_row["raw_target"], 100.0)
+        self.assertEqual(gripper_row["bounded_target"], 95.0)
+        self.assertEqual(gripper_row["absolute_clipped"], 1)
 
 
 if __name__ == "__main__":

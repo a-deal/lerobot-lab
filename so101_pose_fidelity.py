@@ -25,11 +25,10 @@ Current migration boundary
 ``JointTarget`` receipt per joint, keeping the raw proposal, allowed target,
 and saturation flag together.
 
-``calculate_targets`` is the temporary legacy adapter. Existing consumers
-still expect three parallel dictionaries named ``raw``, ``bounded``, and
-``clipped``. The adapter translates the new receipts into that old shape. It
-can be deleted after preview, motion, logging, evaluation, and the self-test
-consume ``JointTarget`` objects directly and their replacement tests pass.
+``calculate_targets`` is the temporary legacy adapter. The preview, motion,
+logging, and final evaluation now carry complete ``JointTarget`` receipts.
+Only compatibility tests and the self-test still use the old three parallel
+dictionaries. The adapter can disappear after those last consumers migrate.
 
 What this module does not prove
 -------------------------------
@@ -46,12 +45,13 @@ Read the functions in this order
 2. ``calculate_joint_targets`` calls the pure translator.
 3. ``legacy_target_views`` and ``calculate_targets`` preserve the temporary
    legacy interface.
-4. ``build_pose_preview`` makes the first downstream ``JointTarget`` consumer.
-5. ``next_commands`` rate-limits one control step.
-6. ``approach_and_hold`` executes and measures one authorized pose.
-7. ``write_cycle_rows`` records the detailed evidence.
-8. ``move_home`` restores the common follower anchor.
-9. ``main`` connects those pieces into the complete operator-gated experiment.
+4. ``build_pose_preview`` shows the proposed receipts before movement.
+5. ``target_log_fields`` translates one receipt into named CSV fields.
+6. ``next_commands`` rate-limits one numerical control step.
+7. ``approach_and_hold`` executes and evaluates one authorized pose.
+8. ``write_cycle_rows`` records the detailed evidence.
+9. ``move_home`` restores the common follower anchor.
+10. ``main`` connects those pieces into the complete operator-gated experiment.
 """
 
 from __future__ import annotations
@@ -68,7 +68,12 @@ from typing import Any
 
 from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
 from lerobot.teleoperators.so101_leader import SO101Leader, SO101LeaderConfig
-from so101_mapping import JointMapping, JointTarget, map_pose_relative
+from so101_mapping import (
+    JointMapping,
+    JointTarget,
+    final_pose_error,
+    map_pose_relative,
+)
 
 
 JOINTS = (
@@ -193,8 +198,7 @@ def calculate_joint_targets(
     one complete receipt for every follower joint. New consumers should use
     this function instead of the legacy three piles.
 
-    Andrew implements the delegation in this exercise. The function must stay
-    hardware-free and must not reshape the mapper's result.
+    The function stays hardware-free and does not reshape the mapper's result.
     """
 
     return map_pose_relative(
@@ -252,8 +256,7 @@ def build_pose_preview(
     for JSON, but it may not connect hardware or send commands.
 
     This is the first production consumer to migrate away from the legacy
-    parallel dictionaries. Andrew implements its returned dictionary in this
-    exercise.
+    parallel dictionaries.
     """
 
     return {
@@ -275,6 +278,27 @@ def build_pose_preview(
             joint: targets[joint].saturated
             for joint in JOINTS
         },
+    }
+
+
+def target_log_fields(target: JointTarget) -> dict[str, float | int]:
+    """Translate one target receipt into the three fields stored in the CSV.
+
+    The mapper uses meaningful Python attributes: ``raw``, ``bounded``, and
+    ``saturated``. The evidence file uses stable column names and stores
+    booleans as ``0`` or ``1``. Keeping this tiny translation in one pure
+    function prevents preview, logging, and evaluation from inventing
+    different interpretations of the same receipt.
+
+    It returns exactly ``raw_target``, ``bounded_target``, and
+    ``absolute_clipped`` without changing either numerical value. The
+    saturation boolean becomes an integer for the CSV.
+    """
+
+    return {
+        "raw_target": target.raw,
+        "bounded_target": target.bounded,
+        "absolute_clipped": int(target.saturated),
     }
 
 
@@ -309,9 +333,7 @@ def write_cycle_rows(
     leader_baseline: dict[str, float],
     leader_captured: dict[str, float],
     leader_live: dict[str, float],
-    raw_targets: dict[str, float],
-    bounded_targets: dict[str, float],
-    absolute_clipped: dict[str, bool],
+    joint_targets: dict[str, JointTarget],
     commanded: dict[str, float],
     rate_limited: dict[str, bool],
     follower_measured: dict[str, float],
@@ -319,14 +341,17 @@ def write_cycle_rows(
 ) -> None:
     """Write one evidence row per joint for one approach or hold cycle.
 
-    Keeping source, target, command, measurement, timing, and limiting values
-    together makes later failures inspectable instead of reducing the run to a
-    single success label.
+    Keeping source, target receipt, command, measurement, timing, and limiting
+    values together makes later failures inspectable instead of reducing the
+    run to a single success label. The whole receipt crosses this boundary so
+    its raw proposal and safety decision cannot become misaligned parallel
+    dictionaries.
     """
 
     wall_time = utc_now()
     monotonic_s = time.monotonic() - process_start
     for joint in JOINTS:
+        target_fields = target_log_fields(joint_targets[joint])
         writer.writerow(
             {
                 "wall_time_utc": wall_time,
@@ -339,14 +364,13 @@ def write_cycle_rows(
                 "leader_captured": leader_captured[joint],
                 "leader_live": leader_live[joint],
                 "leader_delta": leader_captured[joint] - leader_baseline[joint],
-                "raw_target": raw_targets[joint],
-                "bounded_target": bounded_targets[joint],
-                "absolute_clipped": int(absolute_clipped[joint]),
+                **target_fields,
                 "command": commanded[joint],
                 "rate_limited": int(rate_limited[joint]),
                 "follower_measured": follower_measured[joint],
                 "command_error": commanded[joint] - follower_measured[joint],
-                "raw_target_error": raw_targets[joint] - follower_measured[joint],
+                "raw_target_error": joint_targets[joint].raw
+                - follower_measured[joint],
                 "cycle_duration_s": cycle_duration_s,
             }
         )
@@ -362,9 +386,7 @@ def approach_and_hold(
     commanded: dict[str, float],
     leader_baseline: dict[str, float],
     leader_captured: dict[str, float],
-    raw_targets: dict[str, float],
-    bounded_targets: dict[str, float],
-    absolute_clipped: dict[str, bool],
+    joint_targets: dict[str, JointTarget],
     period_s: float,
     max_step: float,
     hold_s: float,
@@ -372,10 +394,16 @@ def approach_and_hold(
     """Approach one authorized target gradually, hold it, and measure error.
 
     This function owns the repeated control cycles after the operator has
-    accepted a preview. It does not decide whether the proposed physical path
-    or pose is collision-free.
+    accepted a preview. It preserves complete receipts for evidence and final
+    evaluation, but extracts their bounded numerical values for the existing
+    rate limiter and motor command API. It does not decide whether the proposed
+    physical path or pose is collision-free.
     """
 
+    bounded_targets = {
+        joint: joint_targets[joint].bounded
+        for joint in JOINTS
+    }
     cycle = 0
     approach_start = time.monotonic()
     rate_limited_cycles = {joint: 0 for joint in JOINTS}
@@ -406,9 +434,7 @@ def approach_and_hold(
             leader_baseline=leader_baseline,
             leader_captured=leader_captured,
             leader_live=leader_live,
-            raw_targets=raw_targets,
-            bounded_targets=bounded_targets,
-            absolute_clipped=absolute_clipped,
+            joint_targets=joint_targets,
             commanded=commanded,
             rate_limited=rate_limited,
             follower_measured=follower_measured,
@@ -438,9 +464,7 @@ def approach_and_hold(
             leader_baseline=leader_baseline,
             leader_captured=leader_captured,
             leader_live=leader_live,
-            raw_targets=raw_targets,
-            bounded_targets=bounded_targets,
-            absolute_clipped=absolute_clipped,
+            joint_targets=joint_targets,
             commanded=commanded,
             rate_limited=rate_limited,
             follower_measured=follower_measured,
@@ -452,9 +476,10 @@ def approach_and_hold(
             time.sleep(remaining)
 
     final_measured = read_positions(follower.bus)
-    final_error = {
-        joint: bounded_targets[joint] - final_measured[joint] for joint in JOINTS
-    }
+    final_error = final_pose_error(
+        targets=joint_targets,
+        follower_measured=final_measured,
+    )
     leader_drift = {
         joint: read_positions(leader.bus)[joint] - leader_captured[joint]
         for joint in JOINTS
@@ -723,10 +748,6 @@ def main() -> int:
                         continue
                     break
 
-                raw_targets, bounded_targets, absolute_clipped = legacy_target_views(
-                    joint_targets
-                )
-
                 commanded, pose_result = approach_and_hold(
                     follower=follower,
                     leader=leader,
@@ -736,9 +757,7 @@ def main() -> int:
                     commanded=commanded,
                     leader_baseline=leader_baseline,
                     leader_captured=leader_captured,
-                    raw_targets=raw_targets,
-                    bounded_targets=bounded_targets,
-                    absolute_clipped=absolute_clipped,
+                    joint_targets=joint_targets,
                     period_s=args.period_s,
                     max_step=args.max_step,
                     hold_s=args.hold_s,
