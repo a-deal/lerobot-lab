@@ -45,11 +45,12 @@ Read the functions in this order
 2. ``calculate_joint_targets`` calls the pure translator.
 3. ``build_pose_preview`` shows the proposed receipts before movement.
 4. ``target_log_fields`` translates one receipt into named CSV fields.
-5. ``next_commands`` rate-limits one numerical control step.
-6. ``approach_and_hold`` executes and evaluates one authorized pose.
-7. ``write_cycle_rows`` records the detailed evidence.
-8. ``move_home`` restores the common follower anchor.
-9. ``main`` connects those pieces into the complete operator-gated experiment.
+5. ``build_pose_result_record`` makes the durable per-pose summary.
+6. ``next_commands`` rate-limits one numerical control step.
+7. ``approach_and_hold`` executes and evaluates one authorized pose.
+8. ``write_cycle_rows`` records the detailed evidence.
+9. ``move_home`` restores the common follower anchor.
+10. ``main`` connects those pieces into the complete operator-gated experiment.
 """
 
 from __future__ import annotations
@@ -265,6 +266,42 @@ def target_log_fields(target: JointTarget) -> dict[str, float | int]:
         "raw_target": target.raw,
         "bounded_target": target.bounded,
         "absolute_clipped": int(target.saturated),
+    }
+
+
+def build_pose_result_record(
+    *,
+    pose_name: str,
+    leader_captured: dict[str, float],
+    targets: dict[str, JointTarget],
+    pose_result: dict[str, Any],
+    visual_judgment: str,
+) -> dict[str, Any]:
+    """Build the durable summary for one completed physical pose.
+
+    The live loop gathers the inputs, but this hardware-free function owns the
+    output contract. Keeping summary construction testable prevents a deleted
+    compatibility variable from surviving unnoticed in ``main`` after the
+    robot has already moved.
+    """
+
+    return {
+        **pose_result,
+        "name": pose_name,
+        "leader_captured": leader_captured,
+        "raw_targets": {
+            joint: targets[joint].raw
+            for joint in JOINTS
+        },
+        "bounded_targets": {
+            joint: targets[joint].bounded
+            for joint in JOINTS
+        },
+        "absolute_clipped": {
+            joint: targets[joint].saturated
+            for joint in JOINTS
+        },
+        "visual_judgment": visual_judgment,
     }
 
 
@@ -740,14 +777,12 @@ def main() -> int:
                     ),
                     flush=True,
                 )
-                pose_result.update(
-                    {
-                        "name": pose_name,
-                        "leader_captured": leader_captured,
-                        "raw_targets": raw_targets,
-                        "bounded_targets": bounded_targets,
-                        "visual_judgment": prompt_visual_judgment(),
-                    }
+                pose_result = build_pose_result_record(
+                    pose_name=pose_name,
+                    leader_captured=leader_captured,
+                    targets=joint_targets,
+                    pose_result=pose_result,
+                    visual_judgment=prompt_visual_judgment(),
                 )
                 receipt["poses"].append(pose_result)
                 commanded = move_home(

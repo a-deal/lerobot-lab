@@ -14,7 +14,9 @@ second test protects the first downstream consumer: ``build_pose_preview``
 must expose every part of each named receipt before motion is authorized.
 The third test protects the receipt-to-CSV vocabulary. The fourth proves that
 the cycle logger passes every joint through that vocabulary rather than
-reconstructing three unrelated target dictionaries.
+reconstructing three unrelated target dictionaries. The fifth protects the
+post-movement summary assembly that a unit test missed during the first live
+run.
 
 ``patch`` temporarily substitutes a controllable mapper result. This isolates
 adapter wiring from mapping arithmetic. These tests never connect serial
@@ -35,6 +37,7 @@ from so101_mapping import JointTarget
 from so101_pose_fidelity import (
     HOME,
     JOINTS,
+    build_pose_result_record,
     build_pose_preview,
     calculate_joint_targets,
     target_log_fields,
@@ -169,6 +172,35 @@ class MappingAdapterTests(unittest.TestCase):
         self.assertEqual(gripper_row["raw_target"], 100.0)
         self.assertEqual(gripper_row["bounded_target"], 95.0)
         self.assertEqual(gripper_row["absolute_clipped"], 1)
+
+    def test_pose_result_record_reads_target_receipts(self) -> None:
+        """Post-movement summary uses receipts instead of deleted variables."""
+
+        leader_captured = {joint: float(index) for index, joint in enumerate(JOINTS)}
+        targets = {
+            joint: JointTarget(
+                raw=100.0 if joint == "gripper" else float(index),
+                bounded=95.0 if joint == "gripper" else float(index),
+                saturated=(joint == "gripper"),
+            )
+            for index, joint in enumerate(JOINTS, start=1)
+        }
+
+        record = build_pose_result_record(
+            pose_name="near",
+            leader_captured=leader_captured,
+            targets=targets,
+            pose_result={"cycles": 55},
+            visual_judgment="match",
+        )
+
+        self.assertEqual(record["cycles"], 55)
+        self.assertEqual(record["name"], "near")
+        self.assertEqual(record["leader_captured"], leader_captured)
+        self.assertEqual(record["raw_targets"]["gripper"], 100.0)
+        self.assertEqual(record["bounded_targets"]["gripper"], 95.0)
+        self.assertTrue(record["absolute_clipped"]["gripper"])
+        self.assertEqual(record["visual_judgment"], "match")
 
 
 if __name__ == "__main__":
