@@ -1,4 +1,4 @@
-"""Test the clean and legacy target interfaces without touching hardware.
+"""Test the clean target handoffs without touching hardware.
 
 Where this module sits
 ----------------------
@@ -8,13 +8,11 @@ This module checks the next handoff: whether ``so101_pose_fidelity`` calls that
 translator with the correct leader snapshots, follower anchor, and six-joint
 configuration.
 
-The first test protects the new interface: ``calculate_joint_targets`` must
-return the mapper's ``JointTarget`` dictionary without reshaping it. The second
-test protects the temporary legacy interface: ``calculate_targets`` must
-unpack those receipts into ``raw``, ``bounded``, and ``clipped`` dictionaries.
-The third test protects the first migrated consumer: ``build_pose_preview``
+The first test protects the mapping entrypoint: ``calculate_joint_targets``
+must return the mapper's ``JointTarget`` dictionary without reshaping it. The
+second test protects the first downstream consumer: ``build_pose_preview``
 must expose every part of each named receipt before motion is authorized.
-The fourth test protects the receipt-to-CSV vocabulary. The fifth proves that
+The third test protects the receipt-to-CSV vocabulary. The fourth proves that
 the cycle logger passes every joint through that vocabulary rather than
 reconstructing three unrelated target dictionaries.
 
@@ -39,14 +37,13 @@ from so101_pose_fidelity import (
     JOINTS,
     build_pose_preview,
     calculate_joint_targets,
-    calculate_targets,
     target_log_fields,
     write_cycle_rows,
 )
 
 
 class MappingAdapterTests(unittest.TestCase):
-    """Prove delegation while preserving the harness's legacy return shape."""
+    """Prove mapper delegation and each hardware-free receipt handoff."""
 
     def test_clean_entrypoint_returns_mapper_joint_targets(self) -> None:
         """The new API returns the mapper's named receipts without reshaping."""
@@ -78,51 +75,6 @@ class MappingAdapterTests(unittest.TestCase):
         self.assertEqual(call["leader_start"], leader_baseline)
         self.assertEqual(call["follower_home"], HOME)
         self.assertEqual(set(call["configuration"]), set(JOINTS))
-
-    def test_calculate_targets_delegates_and_unpacks_joint_targets(self) -> None:
-        leader_baseline = {joint: 0.0 for joint in JOINTS}
-        leader_captured = {joint: 10.0 for joint in JOINTS}
-        mapped_targets = {}
-        for index, joint in enumerate(JOINTS, start=1):
-            raw = 100.0 if joint == "gripper" else float(index)
-            bounded = 95.0 if joint == "gripper" else raw
-            mapped_targets[joint] = JointTarget(
-                raw=raw,
-                bounded=bounded,
-                saturated=(joint == "gripper"),
-            )
-
-        # ``patch`` replaces only the pure mapper call.  If the harness keeps
-        # doing its own arithmetic, this assertion fails and exposes the
-        # duplicate implementation we are trying to remove.
-        with patch(
-            "so101_pose_fidelity.map_pose_relative",
-            return_value=mapped_targets,
-        ) as mapper:
-            raw, bounded, clipped = calculate_targets(
-                leader_captured,
-                leader_baseline,
-            )
-
-        mapper.assert_called_once()
-        call = mapper.call_args.kwargs
-        self.assertEqual(call["leader_now"], leader_captured)
-        self.assertEqual(call["leader_start"], leader_baseline)
-        self.assertEqual(call["follower_home"], HOME)
-        self.assertEqual(set(call["configuration"]), set(JOINTS))
-
-        self.assertEqual(
-            raw,
-            {joint: target.raw for joint, target in mapped_targets.items()},
-        )
-        self.assertEqual(
-            bounded,
-            {joint: target.bounded for joint, target in mapped_targets.items()},
-        )
-        self.assertEqual(
-            clipped,
-            {joint: target.saturated for joint, target in mapped_targets.items()},
-        )
 
     def test_pose_preview_reads_named_joint_target_fields(self) -> None:
         """The no-motion receipt exposes proposals, limits, and saturation."""

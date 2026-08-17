@@ -18,17 +18,17 @@ once, previewed, explicitly authorized, approached through rate-limited
 commands, and held long enough to separate mapping error from settling lag.
 The follower returns to the same operational home between poses.
 
-Current migration boundary
---------------------------
+Current mapping boundary
+------------------------
 
 ``calculate_joint_targets`` is the new clean entrypoint. It returns one
 ``JointTarget`` receipt per joint, keeping the raw proposal, allowed target,
 and saturation flag together.
 
-``calculate_targets`` is the temporary legacy adapter. The preview, motion,
-logging, and final evaluation now carry complete ``JointTarget`` receipts.
-Only compatibility tests and the self-test still use the old three parallel
-dictionaries. The adapter can disappear after those last consumers migrate.
+Preview, motion orchestration, logging, final evaluation, and the self-test all
+carry those same receipts. The old three-parallel-dictionary interface has
+been removed. Only the numerical motor API receives extracted bounded values,
+because it needs destinations rather than mapping evidence.
 
 What this module does not prove
 -------------------------------
@@ -43,15 +43,13 @@ Read the functions in this order
 
 1. ``read_positions`` validates the six-joint hardware state.
 2. ``calculate_joint_targets`` calls the pure translator.
-3. ``legacy_target_views`` and ``calculate_targets`` preserve the temporary
-   legacy interface.
-4. ``build_pose_preview`` shows the proposed receipts before movement.
-5. ``target_log_fields`` translates one receipt into named CSV fields.
-6. ``next_commands`` rate-limits one numerical control step.
-7. ``approach_and_hold`` executes and evaluates one authorized pose.
-8. ``write_cycle_rows`` records the detailed evidence.
-9. ``move_home`` restores the common follower anchor.
-10. ``main`` connects those pieces into the complete operator-gated experiment.
+3. ``build_pose_preview`` shows the proposed receipts before movement.
+4. ``target_log_fields`` translates one receipt into named CSV fields.
+5. ``next_commands`` rate-limits one numerical control step.
+6. ``approach_and_hold`` executes and evaluates one authorized pose.
+7. ``write_cycle_rows`` records the detailed evidence.
+8. ``move_home`` restores the common follower anchor.
+9. ``main`` connects those pieces into the complete operator-gated experiment.
 """
 
 from __future__ import annotations
@@ -207,38 +205,6 @@ def calculate_joint_targets(
         follower_home=HOME,
         configuration=MAPPING_CONFIGURATION,
     )
-
-
-def legacy_target_views(
-    targets: dict[str, JointTarget],
-) -> tuple[dict[str, float], dict[str, float], dict[str, bool]]:
-    """Split named target receipts into the harness's three legacy views.
-
-    This is a temporary compatibility helper. It contains no mapping math and
-    must disappear after preview, motion, logging, evaluation, and self-test
-    code all consume ``JointTarget`` objects directly.
-    """
-
-    raw = {joint: targets[joint].raw for joint in JOINTS}
-    bounded = {joint: targets[joint].bounded for joint in JOINTS}
-    clipped = {joint: targets[joint].saturated for joint in JOINTS}
-    return raw, bounded, clipped
-
-
-def calculate_targets(
-    leader_captured: dict[str, float],
-    leader_baseline: dict[str, float],
-) -> tuple[dict[str, float], dict[str, float], dict[str, bool]]:
-    """Temporarily translate new target receipts into the legacy tuple.
-
-    Existing harness consumers still expect three parallel dictionaries. This
-    wrapper preserves that interface while each consumer migrates to
-    ``calculate_joint_targets``. Delete it after no production call sites use
-    the legacy tuple and the replacement tests are green.
-    """
-
-    targets = calculate_joint_targets(leader_captured, leader_baseline)
-    return legacy_target_views(targets)
 
 
 def build_pose_preview(
@@ -534,17 +500,17 @@ def run_self_test() -> None:
 
     baseline = {joint: 0.0 for joint in JOINTS}
     captured = {joint: 10.0 for joint in JOINTS}
-    raw, bounded, clipped = calculate_targets(captured, baseline)
+    targets = calculate_joint_targets(captured, baseline)
     for joint in JOINTS:
-        assert math.isclose(raw[joint], HOME[joint] + 10.0)
-        assert math.isclose(bounded[joint], raw[joint])
-        assert not clipped[joint]
+        assert math.isclose(targets[joint].raw, HOME[joint] + 10.0)
+        assert math.isclose(targets[joint].bounded, targets[joint].raw)
+        assert not targets[joint].saturated
 
     extreme = dict(captured)
     extreme["shoulder_pan"] = 500.0
-    _, bounded_extreme, clipped_extreme = calculate_targets(extreme, baseline)
-    assert bounded_extreme["shoulder_pan"] == 80.0
-    assert clipped_extreme["shoulder_pan"]
+    extreme_targets = calculate_joint_targets(extreme, baseline)
+    assert extreme_targets["shoulder_pan"].bounded == 80.0
+    assert extreme_targets["shoulder_pan"].saturated
 
     current = {joint: 0.0 for joint in JOINTS}
     target = {joint: 5.0 for joint in JOINTS}
