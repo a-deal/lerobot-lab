@@ -1,0 +1,40 @@
+# Local Python environment and interpreter artifacts
+.venv/
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+
+# Local secrets and machine configuration
+.env
+.env.*
+!.env.example
+*.pem
+*.key
+
+# Generated training, evaluation, and robot-run artifacts
+outputs/
+checkpoints/
+artifacts/
+records/
+logs/
+wandb/
+*.log
+*.safetensors
+*.mp4
+*.mov
+*.npy
+*.npz
+
+# Local datasets and caches
+data/
+datasets/
+.cache/
+
+# Operating-system and editor noise
+.DS_Store
+.idea/
+.vscode/
+*~
+*.swp
