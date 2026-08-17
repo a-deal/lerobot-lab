@@ -21,6 +21,7 @@ from typing import Any
 
 from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
 from lerobot.teleoperators.so101_leader import SO101Leader, SO101LeaderConfig
+from so101_mapping import JointMapping, map_pose_relative
 
 
 JOINTS = (
@@ -52,6 +53,20 @@ ABSOLUTE_BOUNDS = {
 GAINS = {joint: 1.0 for joint in JOINTS}
 OFFSETS = {joint: 0.0 for joint in JOINTS}
 SIGNS = {joint: 1.0 for joint in JOINTS}
+
+# Adapter configuration for the pure mapping module.  The live harness still
+# exposes its legacy three-dictionary result for now; this value translates the
+# harness constants into the mapper's named per-joint contract.
+MAPPING_CONFIGURATION = {
+    joint: JointMapping(
+        sign=SIGNS[joint],
+        gain=GAINS[joint],
+        offset=OFFSETS[joint],
+        minimum=ABSOLUTE_BOUNDS[joint][0],
+        maximum=ABSOLUTE_BOUNDS[joint][1],
+    )
+    for joint in JOINTS
+}
 POSE_NAMES = ("near", "middle", "far")
 
 CSV_FIELDS = (
@@ -109,19 +124,26 @@ def calculate_targets(
     leader_captured: dict[str, float],
     leader_baseline: dict[str, float],
 ) -> tuple[dict[str, float], dict[str, float], dict[str, bool]]:
-    raw: dict[str, float] = {}
-    bounded: dict[str, float] = {}
-    clipped: dict[str, bool] = {}
-    for joint in JOINTS:
-        delta = leader_captured[joint] - leader_baseline[joint]
-        raw[joint] = (
-            HOME[joint]
-            + OFFSETS[joint]
-            + SIGNS[joint] * GAINS[joint] * delta
-        )
-        low, high = ABSOLUTE_BOUNDS[joint]
-        bounded[joint] = clamp(raw[joint], low, high)
-        clipped[joint] = not math.isclose(raw[joint], bounded[joint], abs_tol=1e-12)
+    targets = map_pose_relative(
+        leader_now=leader_captured,
+        leader_start=leader_baseline,
+        follower_home=HOME,
+        configuration=MAPPING_CONFIGURATION,
+    )
+
+    raw = {
+        joint: targets[joint].raw
+        for joint in JOINTS
+    }
+    bounded = {
+        joint: targets[joint].bounded
+        for joint in JOINTS
+    }
+    clipped = {
+        joint: targets[joint].saturated
+        for joint in JOINTS
+    }
+
     return raw, bounded, clipped
 
 
