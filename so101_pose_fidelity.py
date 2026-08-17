@@ -1,10 +1,55 @@
 #!/usr/bin/env python3
-"""Three-pose SO-101 leader/follower fidelity measurement.
+"""Conduct a bounded three-pose SO-101 leader/follower fidelity experiment.
 
-This is intentionally not free-running teleoperation.  Each pose is captured
-once, previewed, explicitly authorized, approached through a rate-limited
-command, and held long enough to distinguish mapping error from settling lag.
+Where this module sits
+----------------------
+
+The human moves the passive leader. This module reads that joint configuration,
+asks ``so101_mapping`` for follower targets, previews the proposed movement,
+and moves the powered follower only after explicit operator authorization.
+
+``so101_mapping`` is the translator. It owns input validation and target math
+but cannot touch hardware. This module is the experiment conductor. It owns
+serial connections, torque lifecycle, incremental commands, human gates,
+measurements, evidence files, and shutdown.
+
+This is intentionally not free-running teleoperation. Each pose is captured
+once, previewed, explicitly authorized, approached through rate-limited
+commands, and held long enough to separate mapping error from settling lag.
 The follower returns to the same operational home between poses.
+
+Current migration boundary
+--------------------------
+
+``calculate_joint_targets`` is the new clean entrypoint. It returns one
+``JointTarget`` receipt per joint, keeping the raw proposal, allowed target,
+and saturation flag together.
+
+``calculate_targets`` is the temporary legacy adapter. Existing consumers
+still expect three parallel dictionaries named ``raw``, ``bounded``, and
+``clipped``. The adapter translates the new receipts into that old shape. It
+can be deleted after preview, motion, logging, evaluation, and the self-test
+consume ``JointTarget`` objects directly and their replacement tests pass.
+
+What this module does not prove
+-------------------------------
+
+Passing software tests does not prove that either arm is calibrated correctly,
+that equal joint coordinates create equal physical poses, or that every
+bounded six-joint combination avoids the table or the robot itself. Those
+claims require controlled hardware trials and recorded measurements.
+
+Read the functions in this order
+--------------------------------
+
+1. ``read_positions`` validates the six-joint hardware state.
+2. ``calculate_joint_targets`` calls the pure translator.
+3. ``calculate_targets`` preserves the temporary legacy interface.
+4. ``next_commands`` rate-limits one control step.
+5. ``approach_and_hold`` executes and measures one authorized pose.
+6. ``write_cycle_rows`` records the detailed evidence.
+7. ``move_home`` restores the common follower anchor.
+8. ``main`` connects those pieces into the complete operator-gated experiment.
 """
 
 from __future__ import annotations
@@ -21,7 +66,7 @@ from typing import Any
 
 from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
 from lerobot.teleoperators.so101_leader import SO101Leader, SO101LeaderConfig
-from so101_mapping import JointMapping, map_pose_relative
+from so101_mapping import JointMapping, JointTarget, map_pose_relative
 
 
 JOINTS = (
@@ -97,10 +142,19 @@ class UserAbort(RuntimeError):
 
 
 def utc_now() -> str:
+    """Return a timezone-aware timestamp for logs and summary receipts."""
+
     return datetime.now(UTC).isoformat()
 
 
 def read_positions(bus: Any) -> dict[str, float]:
+    """Read one complete normalized six-joint state from a connected bus.
+
+    The hardware API may return extra channels, missing joints, or unusable
+    numerical values. This boundary keeps only the expected joints and fails
+    before incomplete state can influence a target or command.
+    """
+
     positions = {
         key: float(value)
         for key, value in bus.sync_read("Present_Position", normalize=True).items()
@@ -117,19 +171,49 @@ def read_positions(bus: Any) -> dict[str, float]:
 
 
 def clamp(value: float, low: float, high: float) -> float:
+    """Keep one control-step value inside an inclusive interval.
+
+    The pure mapper has its own target-bound clamp. This local helper remains
+    because the hardware harness also limits how far a command may move during
+    one control cycle.
+    """
+
     return max(low, min(high, value))
 
+
+def calculate_joint_targets(
+    leader_captured: dict[str, float],
+    leader_baseline: dict[str, float],
+) -> dict[str, JointTarget]:
+    """Return the mapper's new named target receipts for all six joints.
+
+    This is the clean socket. Callers put in two leader snapshots and receive
+    one complete receipt for every follower joint. New consumers should use
+    this function instead of the legacy three piles.
+
+    Andrew implements the delegation in this exercise. The function must stay
+    hardware-free and must not reshape the mapper's result.
+    """
+    return map_pose_relative(
+        leader_now = leader_captured,
+        leader_start = leader_baseline,
+        follower_home = HOME,
+        configuration = MAPPING_CONFIGURATION,
+    )
 
 def calculate_targets(
     leader_captured: dict[str, float],
     leader_baseline: dict[str, float],
 ) -> tuple[dict[str, float], dict[str, float], dict[str, bool]]:
-    targets = map_pose_relative(
-        leader_now=leader_captured,
-        leader_start=leader_baseline,
-        follower_home=HOME,
-        configuration=MAPPING_CONFIGURATION,
-    )
+    """Temporarily translate new target receipts into the legacy tuple.
+
+    Existing harness consumers still expect three parallel dictionaries. This
+    wrapper preserves that interface while each consumer migrates to
+    ``calculate_joint_targets``. Delete it after no production call sites use
+    the legacy tuple and the replacement tests are green.
+    """
+
+    targets = calculate_joint_targets(leader_captured, leader_baseline)
 
     raw = {
         joint: targets[joint].raw
@@ -152,6 +236,12 @@ def next_commands(
     targets: dict[str, float],
     max_step: float,
 ) -> tuple[dict[str, float], dict[str, bool]]:
+    """Move every current command toward its target by at most ``max_step``.
+
+    The returned boolean dictionary records which joints were rate-limited.
+    This is command pacing, not target validation or collision avoidance.
+    """
+
     next_values: dict[str, float] = {}
     limited: dict[str, bool] = {}
     for joint in JOINTS:
@@ -180,6 +270,13 @@ def write_cycle_rows(
     follower_measured: dict[str, float],
     cycle_duration_s: float,
 ) -> None:
+    """Write one evidence row per joint for one approach or hold cycle.
+
+    Keeping source, target, command, measurement, timing, and limiting values
+    together makes later failures inspectable instead of reducing the run to a
+    single success label.
+    """
+
     wall_time = utc_now()
     monotonic_s = time.monotonic() - process_start
     for joint in JOINTS:
@@ -225,6 +322,13 @@ def approach_and_hold(
     max_step: float,
     hold_s: float,
 ) -> tuple[dict[str, float], dict[str, Any]]:
+    """Approach one authorized target gradually, hold it, and measure error.
+
+    This function owns the repeated control cycles after the operator has
+    accepted a preview. It does not decide whether the proposed physical path
+    or pose is collision-free.
+    """
+
     cycle = 0
     approach_start = time.monotonic()
     rate_limited_cycles = {joint: 0 for joint in JOINTS}
@@ -328,6 +432,8 @@ def move_home(
     period_s: float,
     max_step: float,
 ) -> dict[str, float]:
+    """Rate-limit the follower back to the fixed operational home."""
+
     while max(abs(commanded[joint] - HOME[joint]) for joint in JOINTS) > 0.05:
         commanded, _ = next_commands(commanded, HOME, max_step)
         follower.bus.sync_write("Goal_Position", commanded)
@@ -336,6 +442,8 @@ def move_home(
 
 
 def prompt_visual_judgment() -> str:
+    """Collect the operator's physical-pose label using fixed vocabulary."""
+
     while True:
         answer = input(
             "While the follower holds: type MATCH, MISMATCH, or UNCLEAR for the physical pose.\n"
@@ -346,6 +454,12 @@ def prompt_visual_judgment() -> str:
 
 
 def run_self_test() -> None:
+    """Exercise mapping and rate limiting with ordinary numbers only.
+
+    This smoke test never constructs a robot or connects to a serial port. It
+    catches integration breakage but cannot validate physical behavior.
+    """
+
     baseline = {joint: 0.0 for joint in JOINTS}
     captured = {joint: 10.0 for joint in JOINTS}
     raw, bounded, clipped = calculate_targets(captured, baseline)
@@ -369,6 +483,8 @@ def run_self_test() -> None:
 
 
 def parse_args() -> argparse.Namespace:
+    """Build and parse the command-line configuration for one run."""
+
     parser = argparse.ArgumentParser(
         description="Run three explicitly approved, held SO-101 pose-fidelity measurements."
     )
@@ -389,6 +505,13 @@ def parse_args() -> argparse.Namespace:
 
 
 def main() -> int:
+    """Run the operator-gated experiment and always release owned resources.
+
+    ``main`` is the only orchestration layer: it connects both arms, verifies
+    torque preconditions, captures anchors and poses, authorizes movement,
+    records evidence, and performs shutdown cleanup.
+    """
+
     args = parse_args()
     if args.self_test:
         run_self_test()

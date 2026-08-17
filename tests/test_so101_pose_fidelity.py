@@ -1,12 +1,25 @@
-"""Compatibility tests for the live harness-to-mapper adapter.
+"""Test the clean and legacy target interfaces without touching hardware.
 
-The pure mapper returns one ``JointTarget`` object per joint.  The current
-hardware harness still expects three parallel dictionaries.  This test fixes
-that temporary boundary in place so the calculation engine can change without
-silently changing the rest of the motion harness in the same step.
+Where this module sits
+----------------------
 
-This is a hardware-free contract test.  It does not connect to serial ports,
-enable torque, command movement, or establish physical pose fidelity.
+``test_so101_mapping`` proves the translator's numerical rules in isolation.
+This module checks the next handoff: whether ``so101_pose_fidelity`` calls that
+translator with the correct leader snapshots, follower anchor, and six-joint
+configuration.
+
+The first test protects the new interface: ``calculate_joint_targets`` must
+return the mapper's ``JointTarget`` dictionary without reshaping it. The second
+test protects the temporary legacy interface: ``calculate_targets`` must
+unpack those receipts into ``raw``, ``bounded``, and ``clipped`` dictionaries.
+
+``patch`` temporarily substitutes a controllable mapper result. This isolates
+adapter wiring from mapping arithmetic. These tests never connect serial
+ports, enable torque, command movement, or establish physical pose fidelity.
+
+Read each test as arrange, act, assert: prepare snapshots and receipts, call
+the public harness function, then verify both the mapper call and returned
+contract.
 """
 
 from __future__ import annotations
@@ -15,11 +28,47 @@ import unittest
 from unittest.mock import patch
 
 from so101_mapping import JointTarget
-from so101_pose_fidelity import HOME, JOINTS, calculate_targets
+from so101_pose_fidelity import (
+    HOME,
+    JOINTS,
+    calculate_joint_targets,
+    calculate_targets,
+)
 
 
 class MappingAdapterTests(unittest.TestCase):
     """Prove delegation while preserving the harness's legacy return shape."""
+
+    def test_clean_entrypoint_returns_mapper_joint_targets(self) -> None:
+        """The new API returns the mapper's named receipts without reshaping."""
+
+        leader_baseline = {joint: 0.0 for joint in JOINTS}
+        leader_captured = {joint: 10.0 for joint in JOINTS}
+        mapped_targets = {
+            joint: JointTarget(
+                raw=float(index),
+                bounded=float(index),
+                saturated=False,
+            )
+            for index, joint in enumerate(JOINTS, start=1)
+        }
+
+        with patch(
+            "so101_pose_fidelity.map_pose_relative",
+            return_value=mapped_targets,
+        ) as mapper:
+            result = calculate_joint_targets(
+                leader_captured,
+                leader_baseline,
+            )
+
+        self.assertIs(result, mapped_targets)
+        mapper.assert_called_once()
+        call = mapper.call_args.kwargs
+        self.assertEqual(call["leader_now"], leader_captured)
+        self.assertEqual(call["leader_start"], leader_baseline)
+        self.assertEqual(call["follower_home"], HOME)
+        self.assertEqual(set(call["configuration"]), set(JOINTS))
 
     def test_calculate_targets_delegates_and_unpacks_joint_targets(self) -> None:
         leader_baseline = {joint: 0.0 for joint in JOINTS}
