@@ -579,6 +579,40 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def cleanup_connected_arms(
+    *,
+    leader_bus: Any,
+    follower_bus: Any,
+    leader_torque_owned: bool,
+    follower_torque_owned: bool,
+) -> list[str]:
+    """Attempt every applicable cleanup step and return any failures."""
+
+    errors: list[str] = []
+    if leader_bus.is_connected and leader_torque_owned:
+        try:
+            leader_bus.disable_torque(list(JOINTS))
+        except Exception as exc:
+            errors.append(f"leader torque-off failed: {exc}")
+    if follower_bus.is_connected and follower_torque_owned:
+        try:
+            follower_bus.disable_torque(list(JOINTS))
+        except Exception as exc:
+            errors.append(f"follower torque-off failed: {exc}")
+    if follower_bus.is_connected:
+        try:
+            follower_bus.disconnect(disable_torque=False)
+        except Exception as exc:
+            errors.append(f"follower disconnect failed: {exc}")
+    if leader_bus.is_connected:
+        try:
+            leader_bus.disconnect(disable_torque=False)
+        except Exception as exc:
+            errors.append(f"leader disconnect failed: {exc}")
+
+    return errors
+
+
 def main() -> int:
     """Run the operator-gated experiment and always release owned resources.
 
@@ -628,7 +662,8 @@ def main() -> int:
         "csv_path": str(csv_path),
         "summary_path": str(summary_path),
     }
-    torque_owned = False
+    follower_torque_owned = False
+    leader_torque_owned = False
 
     try:
         with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
@@ -676,7 +711,7 @@ def main() -> int:
 
             follower.bus.sync_write("Goal_Position", present)
             follower.bus.enable_torque(list(JOINTS))
-            torque_owned = True
+            follower_torque_owned = True
             time.sleep(0.4)
             commanded = move_home(
                 follower,
@@ -818,20 +853,26 @@ def main() -> int:
         raise
     finally:
         receipt["finished_at"] = utc_now()
-        if follower.bus.is_connected:
+
+        if follower.bus.is_connected and follower_torque_owned:
             try:
-                if torque_owned:
-                    try:
-                        input(
-                            "Support the follower, then press ENTER to disable torque and exit.\n"
-                        )
-                    except (EOFError, KeyboardInterrupt):
-                        print("Disabling follower torque now.", flush=True)
-                    follower.bus.disable_torque(list(JOINTS))
-            finally:
-                follower.bus.disconnect(disable_torque=False)
-        if leader.bus.is_connected:
-            leader.bus.disconnect(disable_torque=False)
+                input(
+                    "Support the follower, then press ENTER to disable torque and exit.\n"
+                )
+            except (EOFError, KeyboardInterrupt):
+                print("Disabling follower torque now.", flush=True)
+        cleanup_errors = cleanup_connected_arms(
+            leader_bus=leader.bus,
+            follower_bus=follower.bus,
+            leader_torque_owned=leader_torque_owned,
+            follower_torque_owned=follower_torque_owned,
+        )
+
+        if cleanup_errors:
+            receipt["cleanup_errors"] = cleanup_errors
+            if receipt["status"] == "completed":
+                receipt["status"] = "cleanup_failed"
+
         summary_path.write_text(
             json.dumps(receipt, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",

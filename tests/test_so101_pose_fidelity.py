@@ -40,6 +40,7 @@ from so101_pose_fidelity import (
     build_pose_result_record,
     build_pose_preview,
     calculate_joint_targets,
+    cleanup_connected_arms,
     target_log_fields,
     write_cycle_rows,
 )
@@ -201,6 +202,33 @@ class MappingAdapterTests(unittest.TestCase):
         self.assertEqual(record["bounded_targets"]["gripper"], 95.0)
         self.assertTrue(record["absolute_clipped"]["gripper"])
         self.assertEqual(record["visual_judgment"], "match")
+
+    def test_cleanup_continues_after_leader_torque_failure(self) -> None:
+        """Leader torque-off failure does not prevent remaining cleanup attempts."""
+
+        leader_bus = Mock()
+        leader_bus.is_connected = True
+        leader_bus.disable_torque.side_effect = RuntimeError(
+            "Leader torque failure"
+        )
+        follower_bus = Mock()
+        follower_bus.is_connected = True
+        errors = cleanup_connected_arms(
+            leader_bus=leader_bus,
+            follower_bus=follower_bus,
+            leader_torque_owned=True,
+            follower_torque_owned=True,
+        )
+
+        leader_bus.disable_torque.assert_called_once_with(list(JOINTS))
+        follower_bus.disable_torque.assert_called_once_with(list(JOINTS))
+
+        leader_bus.disconnect.assert_called_once_with(disable_torque=False)
+        follower_bus.disconnect.assert_called_once_with(disable_torque=False)
+
+        self.assertTrue(
+            any("leader" in error for error in errors),
+        )
 
 
 if __name__ == "__main__":

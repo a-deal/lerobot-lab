@@ -140,6 +140,84 @@ operator gates, evidence, and cleanup.
 | `parse_args` | Read the operator's command-line settings. | Builds the runtime configuration. |
 | `main` | Conduct the entire experiment from connection through cleanup. | Owns serial connection, torque lifecycle, operator gates, trials, receipts, and shutdown. |
 
+### Python execution and exception flow
+
+This harness is synchronous. Its execution model is the same basic model as
+JavaScript's synchronous `try`/`catch`/`finally`: each function call adds a
+frame to a stack of paused callers. A normal return removes the current frame
+and gives a value back to its caller. An exception interrupts the current path
+and searches backward through those callers for a matching handler.
+
+```text
+module entrypoint
+        ↓ calls
+main
+        ↓ calls
+cleanup_connected_arms
+        ↓ calls
+bus.disable_torque
+
+An uncaught exception travels back up this stack in the opposite direction.
+```
+
+The important Python operations have separate meanings:
+
+| Operation | Meaning |
+|---|---|
+| `raise SomeError(...)` | Start propagating a new exception. |
+| `except SomeError` | Intercept a matching exception at this layer and decide what happens next. |
+| bare `raise` inside `except` | Continue propagating the same exception after recording or adding context. |
+| `finally` | Run this block before leaving the `try`, whether the path succeeds, returns, or propagates an exception. |
+
+Catching an exception does not automatically mean the program failed, and it
+does not automatically mean the program recovered. The handler makes that
+policy decision:
+
+- catch and continue when this layer can restore a valid state or choose a
+  safe fallback;
+- catch and convert the exception into ordinary result data when callers need
+  to inspect a degraded outcome;
+- catch, record, and re-raise when the layer must preserve evidence but cannot
+  safely continue normal work;
+- do not catch when a higher caller is the first layer that can make a useful
+  decision.
+
+`cleanup_connected_arms` uses the second pattern. Each applicable torque-off
+or disconnect attempt has its own exception boundary. A failure becomes a
+labeled string in `cleanup_errors`, and the helper continues trying the other
+independent cleanup actions. This is best-effort continuation, not proof that
+torque was physically disabled or that either arm reached a safe pose.
+
+`main` owns the top-level outcome. Its receipt and process behavior follow this
+contract:
+
+| Experiment body | Cleanup | Receipt status | Process behavior |
+|---|---|---|---|
+| completes | succeeds | `completed` | return `0` |
+| completes | reports errors | `cleanup_failed` plus `cleanup_errors` | return `1` |
+| operator abort or handled interrupt | any cleanup result | preserve the earlier status and attach any `cleanup_errors` | return `1` |
+| raises an unexpected `Exception` | any cleanup result | `failed`, original `error`, plus any `cleanup_errors` | write the receipt, then re-raise the original exception |
+
+The unexpected-exception handler in `main` records the primary experiment
+failure and uses bare `raise`. The outer `finally` then runs cleanup and writes
+the receipt before that original exception leaves `main`. The cleanup error is
+not hidden: it remains in the receipt as secondary evidence. The compact
+shutdown message prints the final status and receipt path; the receipt file is
+the complete record.
+
+The final success rule is therefore:
+
+```text
+success = experiment completed AND required cleanup reported no errors
+```
+
+When this module is imported by a unit test, Python defines its functions but
+does not run `main` because `__name__ != "__main__"`. The cleanup unit test can
+therefore inject failures into mock buses without connecting hardware. Its
+current leader-torque-failure case proves that the expected calls are attempted
+and later disconnect cleanup continues; it does not prove physical shutdown or
+every possible cleanup-failure position.
+
 ### Andrew-owned implementation surface
 
 For this exercise Andrew implements only the body of `calculate_targets`.
