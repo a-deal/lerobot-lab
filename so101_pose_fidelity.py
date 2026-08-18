@@ -613,6 +613,16 @@ def cleanup_connected_arms(
     return errors
 
 
+def record_cleanup_errors(
+    receipt: dict[str, Any], cleanup_errors: list[str]
+) -> None:
+    """Attach cleanup evidence without hiding a primary experiment failure."""
+
+    if receipt["status"] == "completed":
+        receipt["status"] = "cleanup_failed"
+    receipt["cleanup_errors"] = cleanup_errors
+
+
 def main() -> int:
     """Run the operator-gated experiment and always release owned resources.
 
@@ -869,9 +879,7 @@ def main() -> int:
         )
 
         if cleanup_errors:
-            receipt["cleanup_errors"] = cleanup_errors
-            if receipt["status"] == "completed":
-                receipt["status"] = "cleanup_failed"
+            record_cleanup_errors(receipt, cleanup_errors)
 
         summary_path.write_text(
             json.dumps(receipt, indent=2, sort_keys=True) + "\n",

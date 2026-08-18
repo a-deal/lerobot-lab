@@ -41,6 +41,7 @@ from so101_pose_fidelity import (
     build_pose_preview,
     calculate_joint_targets,
     cleanup_connected_arms,
+    record_cleanup_errors,
     target_log_fields,
     write_cycle_rows,
 )
@@ -229,6 +230,32 @@ class MappingAdapterTests(unittest.TestCase):
         self.assertTrue(
             any("leader" in error for error in errors),
         )
+
+    def test_cleanup_errors_mark_completed_receipt_failed(self) -> None:
+        """A cleanup failure prevents a completed final status."""
+
+        receipt = {"status": "completed"}
+        cleanup_errors = ["leader torque failure"]
+
+        record_cleanup_errors(receipt, cleanup_errors)
+
+        self.assertEqual(receipt["status"], "cleanup_failed")
+        self.assertEqual(receipt["cleanup_errors"], cleanup_errors)
+
+    def test_cleanup_errors_preserve_existing_failure(self) -> None:
+        """Cleanup evidence does not overwrite the experiment failure."""
+
+        receipt = {
+            "status": "failed",
+            "error": "RuntimeError: movement failed",
+        }
+        cleanup_errors = ["follower disconnect failure"]
+
+        record_cleanup_errors(receipt, cleanup_errors)
+
+        self.assertEqual(receipt["status"], "failed")
+        self.assertEqual(receipt["error"], "RuntimeError: movement failed")
+        self.assertEqual(receipt["cleanup_errors"], cleanup_errors)
 
 
 if __name__ == "__main__":
