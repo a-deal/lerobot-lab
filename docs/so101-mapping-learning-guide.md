@@ -76,7 +76,7 @@ It makes the live harness depend on the already-tested mapper.
 The bounded definition of done is:
 
 1. integrate one existing pure module, `so101_mapping.py`, into one existing
-   hardware harness, `run_so101_teleoperation_validation.py`;
+   hardware workflow, `so101_teleoperation_validation.py`;
 2. add one hardware-free adapter test;
 3. keep all eleven pure-mapper tests green;
 4. make the one adapter test green;
@@ -99,7 +99,7 @@ mapping exercise while the architecture notes describe the current boundary.
 ```text
 leader positions captured by the hardware harness
                     ↓
-calculate_targets adapter in run_so101_teleoperation_validation.py
+calculate_targets adapter in so101_teleoperation_validation.py
                     ↓
 map_pose_relative in so101_mapping.py
                     ↓
@@ -111,7 +111,7 @@ preview, command, logging, and evaluation consumers
 `so101_mapping.py` is the translator. It owns validation and target math but
 must remain unable to touch hardware. `so101_lifecycle.py` owns each arm's
 goal-alignment ordering and torque-cleanup obligation.
-`run_so101_teleoperation_validation.py` conducts the validation. It owns
+`so101_teleoperation_validation.py` conducts the validation. It owns
 hardware reads, command timing, operator gates, multi-arm cleanup, evidence,
 and receipt policy.
 

@@ -33,7 +33,7 @@ import unittest
 from typing import Literal
 from unittest.mock import Mock, call, patch
 
-from run_so101_teleoperation_validation import (
+from so101_teleoperation_validation import (
     HOME,
     JOINTS,
     UNPOWERED_REST,
@@ -69,7 +69,7 @@ class MappingAdapterTests(unittest.TestCase):
         }
 
         with patch(
-            "run_so101_teleoperation_validation.map_pose_relative",
+            "so101_teleoperation_validation.map_pose_relative",
             return_value=mapped_targets,
         ) as mapper:
             result = calculate_joint_targets(
@@ -318,7 +318,7 @@ class MappingAdapterTests(unittest.TestCase):
             self.fail("unexpected bus read")
 
         with patch(
-            "run_so101_teleoperation_validation.read_positions",
+            "so101_teleoperation_validation.read_positions",
             side_effect=fake_read_positions,
         ) as read_positions_mock:
             _, result = approach_and_hold(

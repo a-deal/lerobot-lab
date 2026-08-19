@@ -11,13 +11,14 @@ This is a **lab containing several small workflows**, not one application with
 one universal `main.py`.
 
 In Python, `main.py` is a convention, not a requirement. Any file can be an
-executable entrypoint. `run_so101_teleoperation_validation.py` contains its own
-workflow function and can be executed directly. `inspect_sample.py` is another
-standalone script.
+executable entrypoint. `run_so101_teleoperation_validation.py` contains the
+small `main()` for this workflow and can be executed directly.
+`inspect_sample.py` is another standalone script.
 
-`so101_mapping.py` and `so101_lifecycle.py` are library modules imported by the
-runner. The mapper is hardware-free; the lifecycle module wraps one arm's bus
-to own goal-alignment, torque transitions, and cleanup obligation state.
+`so101_teleoperation_validation.py`, `so101_mapping.py`, and
+`so101_lifecycle.py` are importable library modules. The workflow coordinates
+the validation, the mapper is hardware-free, and the lifecycle module wraps
+one arm's bus to own goal-alignment, torque transitions, and cleanup state.
 
 The training workflow begins with `run-first-train.sh`. That file is a shell
 script, not Python. It configures the local environment and calls
@@ -44,10 +45,11 @@ run-first-train.sh
 
 Lane B: SO-101 leader/follower teleoperation validation
 
-run_so101_teleoperation_validation.py     executable validation entrypoint
-  -> imports so101_mapping.py             pure translation library
-  -> imports so101_lifecycle.py           per-arm torque lifecycle
-  -> imports LeRobot SO-101 drivers       hardware communication
+run_so101_teleoperation_validation.py     thin executable entrypoint
+  -> calls so101_teleoperation_validation.py
+     -> imports so101_mapping.py          pure translation library
+     -> imports so101_lifecycle.py        per-arm torque lifecycle
+     -> imports LeRobot SO-101 drivers    hardware communication
   -> reads leader and follower state
   -> previews and operator-gates targets
   -> rate-limits follower commands
@@ -63,9 +65,9 @@ tests/test_so101_teleoperation_validation.py
 The dependency direction is deliberate:
 
 ```text
-teleoperation runner -> pure mapping module
-                     -> per-arm lifecycle -> LeRobot bus
-tests                -> public functions in all three modules
+thin CLI -> teleoperation workflow -> pure mapping module
+                               \-> per-arm lifecycle -> LeRobot bus
+tests    -> public functions in the workflow, lifecycle, and mapper
 
 pure mapping module  -X-> lifecycle, hardware, or runner
 ```
@@ -160,9 +162,10 @@ Expect it to be slow on MPS. The point is not a SOTA policy, it's watching loss 
   library; never commands hardware.
 - `so101_lifecycle.py`: one arm's goal-alignment ordering, torque transitions,
   and conservative software cleanup obligation.
-- `run_so101_teleoperation_validation.py`: executable, operator-gated physical
-  validation and hardware-free self-test; contains the SO-101 workflow's
-  `run_teleoperation_validation()` function.
+- `so101_teleoperation_validation.py`: importable operator-gated validation
+  workflow and hardware-free self-test implementation.
+- `run_so101_teleoperation_validation.py`: thin executable containing `main()`
+  and delegating to the importable workflow.
 - `tests/test_so101_mapping.py`: pure mapping unit and six-joint contracts.
 - `tests/test_so101_teleoperation_validation.py`: hardware-free runner,
   lifecycle, cleanup, and mapping-integration contracts.
@@ -175,14 +178,14 @@ Expect it to be slow on MPS. The point is not a SOTA policy, it's watching loss 
 ## Reading order for the current SO-101 work
 
 1. Read this README for repository and workflow taxonomy.
-2. Read the top of `run_so101_teleoperation_validation.py` for the live
-   validation boundary and orchestration flow.
-3. Read `so101_lifecycle.py` for per-arm torque state transitions.
-4. Read the top of `so101_mapping.py` for the pure translator contract.
-5. Read `tests/test_so101_teleoperation_validation.py` for lifecycle, cleanup,
+2. Read `run_so101_teleoperation_validation.py` for the executable boundary.
+3. Read the top of `so101_teleoperation_validation.py` for orchestration flow.
+4. Read `so101_lifecycle.py` for per-arm torque state transitions.
+5. Read the top of `so101_mapping.py` for the pure translator contract.
+6. Read `tests/test_so101_teleoperation_validation.py` for lifecycle, cleanup,
    and harness handoffs.
-6. Read `tests/test_so101_mapping.py` for the mapper's numerical edge cases.
-7. Use `docs/so101-mapping-learning-guide.md` only when deeper terminology or
+7. Read `tests/test_so101_mapping.py` for the mapper's numerical edge cases.
+8. Use `docs/so101-mapping-learning-guide.md` only when deeper terminology or
    historical implementation sequence is useful.
 
 ## Notes
