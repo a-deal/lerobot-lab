@@ -52,8 +52,11 @@ Read the functions in this order
 7. ``approach_and_hold`` executes and evaluates one authorized pose.
 8. ``write_cycle_rows`` records the detailed evidence.
 9. ``move_home`` restores the common follower anchor.
-10. ``run_teleoperation_validation`` connects those pieces into the complete
-    operator-gated validation.
+10. ``connect_and_validate_arms`` performs read-only connection preflight.
+11. ``prepare_follower_at_operational_home`` owns the authorized startup move.
+12. ``run_pose_validation_trial`` conducts one previewed and authorized trial.
+13. ``run_teleoperation_validation`` connects those phases into the complete
+    three-pose validation and owns the final receipt policy.
 """
 
 from __future__ import annotations
@@ -63,6 +66,7 @@ import csv
 import json
 import math
 import time
+from collections.abc import Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -707,6 +711,142 @@ def prepare_follower_at_operational_home(
     return OperationalHomeSnapshot(commanded=commanded, observed=observed)
 
 
+def run_pose_validation_trial(
+    *,
+    pose_name: str,
+    leader: SO101Leader,
+    follower: SO101Follower,
+    leader_lifecycle: ArmLifecycle,
+    writer: csv.DictWriter,
+    flush_cycle_evidence: Callable[[], None],
+    process_start: float,
+    commanded: dict[str, float],
+    leader_baseline: dict[str, float],
+    pose_results: list[dict[str, Any]],
+    period_s: float,
+    max_step: float,
+    hold_s: float,
+) -> dict[str, float]:
+    """Run one authorized pose trial and return the follower at home."""
+    while True:
+        input(
+            f"Move the passive leader to the {pose_name.upper()} collision-safe pose and hold it. "
+            "Press ENTER for a no-motion preview.\n"
+        )
+        leader_captured = read_positions(leader.bus)
+        joint_targets = calculate_joint_targets(leader_captured, leader_baseline)
+        preview = build_pose_preview(
+            pose_name=pose_name,
+            leader_captured=leader_captured,
+            leader_baseline=leader_baseline,
+            targets=joint_targets,
+        )
+
+        print(json.dumps(preview, indent=2), flush=True)
+        if any(target.saturated for target in joint_targets.values()):
+            print(
+                "Rejected: at least one target crossed an absolute margin. "
+                "Reposition the leader; no motion was sent.",
+                flush=True,
+            )
+            continue
+        answer = (
+            input(
+                "Inspect both motion envelopes. Type MOVE to execute this held pose, "
+                "REDO to recapture, or QUIT to shut down.\n"
+            )
+            .strip()
+            .upper()
+        )
+        if answer == "REDO":
+            continue
+        if answer == "QUIT":
+            raise UserAbort("operator ended before all poses")
+        if answer != "MOVE":
+            print("Expected MOVE, REDO, or QUIT.", flush=True)
+            continue
+        break
+
+    leader_lifecycle.align_goals_and_enable_torque(leader_captured)
+    time.sleep(0.2)
+    print(
+        json.dumps(
+            {
+                "stage": "leader_pose_hold",
+                "pose": pose_name,
+                "leader_captured": leader_captured,
+                "leader_hold_observed": read_positions(leader.bus),
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
+    commanded, pose_result = approach_and_hold(
+        follower=follower,
+        leader=leader,
+        writer=writer,
+        process_start=process_start,
+        pose_name=pose_name,
+        commanded=commanded,
+        leader_baseline=leader_baseline,
+        leader_captured=leader_captured,
+        joint_targets=joint_targets,
+        period_s=period_s,
+        max_step=max_step,
+        hold_s=hold_s,
+    )
+
+    flush_cycle_evidence()
+
+    print(
+        json.dumps(
+            {
+                "stage": "pose_holding",
+                "pose": pose_name,
+                "result": pose_result,
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
+    pose_result = build_pose_result_record(
+        pose_name=pose_name,
+        leader_captured=leader_captured,
+        targets=joint_targets,
+        pose_result=pose_result,
+        visual_judgment=prompt_visual_judgment(),
+    )
+    pose_results.append(pose_result)
+    leader_lifecycle.disable_torque_if_required()
+    print(
+        json.dumps(
+            {"stage": "leader_released", "pose": pose_name},
+            indent=2,
+        ),
+        flush=True,
+    )
+    commanded = move_home(
+        follower,
+        commanded,
+        period_s=period_s,
+        max_step=max_step,
+    )
+    time.sleep(0.5)
+    pose_result["home_return_observed"] = read_positions(follower.bus)
+    print(
+        json.dumps(
+            {
+                "stage": "returned_home",
+                "pose": pose_name,
+                "home_return_observed": pose_result["home_return_observed"],
+            },
+            indent=2,
+        ),
+        flush=True,
+    )
+    return commanded
+
+
 def cleanup_connected_arms(
     *,
     leader_lifecycle: ArmLifecycle,
@@ -850,124 +990,21 @@ def run_teleoperation_validation() -> int:
             )
 
             for pose_name in POSE_NAMES:
-                while True:
-                    input(
-                        f"Move the passive leader to the {pose_name.upper()} collision-safe pose and hold it. "
-                        "Press ENTER for a no-motion preview.\n"
-                    )
-                    leader_captured = read_positions(leader.bus)
-                    joint_targets = calculate_joint_targets(
-                        leader_captured,
-                        leader_baseline,
-                    )
-                    preview = build_pose_preview(
-                        pose_name=pose_name,
-                        leader_captured=leader_captured,
-                        leader_baseline=leader_baseline,
-                        targets=joint_targets,
-                    )
-                    print(json.dumps(preview, indent=2), flush=True)
-                    if any(target.saturated for target in joint_targets.values()):
-                        print(
-                            "Rejected: at least one target crossed an absolute margin. "
-                            "Reposition the leader; no motion was sent.",
-                            flush=True,
-                        )
-                        continue
-                    answer = (
-                        input(
-                            "Inspect both motion envelopes. Type MOVE to execute this held pose, "
-                            "REDO to recapture, or QUIT to shut down.\n"
-                        )
-                        .strip()
-                        .upper()
-                    )
-                    if answer == "REDO":
-                        continue
-                    if answer == "QUIT":
-                        raise UserAbort("operator ended before all poses")
-                    if answer != "MOVE":
-                        print("Expected MOVE, REDO, or QUIT.", flush=True)
-                        continue
-                    break
-
-                leader_lifecycle.align_goals_and_enable_torque(leader_captured)
-                time.sleep(0.2)
-                print(
-                    json.dumps(
-                        {
-                            "stage": "leader_pose_hold",
-                            "pose": pose_name,
-                            "leader_captured": leader_captured,
-                            "leader_hold_observed": read_positions(leader.bus),
-                        },
-                        indent=2,
-                    ),
-                    flush=True,
-                )
-                commanded, pose_result = approach_and_hold(
-                    follower=follower,
-                    leader=leader,
-                    writer=writer,
-                    process_start=process_start,
+                commanded = run_pose_validation_trial(
                     pose_name=pose_name,
+                    leader=leader,
+                    follower=follower,
+                    leader_lifecycle=leader_lifecycle,
+                    writer=writer,
+                    flush_cycle_evidence=csv_file.flush,
+                    process_start=process_start,
                     commanded=commanded,
                     leader_baseline=leader_baseline,
-                    leader_captured=leader_captured,
-                    joint_targets=joint_targets,
+                    pose_results=receipt["poses"],
                     period_s=args.period_s,
                     max_step=args.max_step,
                     hold_s=args.hold_s,
                 )
-                csv_file.flush()
-                print(
-                    json.dumps(
-                        {
-                            "stage": "pose_holding",
-                            "pose": pose_name,
-                            "result": pose_result,
-                        },
-                        indent=2,
-                    ),
-                    flush=True,
-                )
-                pose_result = build_pose_result_record(
-                    pose_name=pose_name,
-                    leader_captured=leader_captured,
-                    targets=joint_targets,
-                    pose_result=pose_result,
-                    visual_judgment=prompt_visual_judgment(),
-                )
-                receipt["poses"].append(pose_result)
-                leader_lifecycle.disable_torque_if_required()
-
-                print(
-                    json.dumps(
-                        {"stage": "leader_released", "pose": pose_name},
-                        indent=2,
-                    ),
-                    flush=True,
-                )
-                commanded = move_home(
-                    follower,
-                    commanded,
-                    period_s=args.period_s,
-                    max_step=args.max_step,
-                )
-                time.sleep(0.5)
-                pose_result["home_return_observed"] = read_positions(follower.bus)
-                print(
-                    json.dumps(
-                        {
-                            "stage": "returned_home",
-                            "pose": pose_name,
-                            "home_return_observed": pose_result["home_return_observed"],
-                        },
-                        indent=2,
-                    ),
-                    flush=True,
-                )
-
             receipt["status"] = "completed"
     except UserAbort as exc:
         receipt["status"] = "operator_aborted"

@@ -142,7 +142,10 @@ and receipt policy.
 | `run_self_test` | Rehearse the arithmetic with pretend numbers and no robot. | Provides a quick hardware-free integration smoke test. |
 | `parse_args` | Read the operator's command-line settings. | Builds the runtime configuration. |
 | `ArmLifecycle` | Keep one arm's torque-cleanup sticky note with its bus. | Owns goal alignment, torque transitions, and the conservative cleanup obligation. |
-| `run_teleoperation_validation` | Conduct the entire validation from connection through cleanup. | Owns serial connection, lifecycle coordination, operator gates, trials, receipts, and shutdown. |
+| `connect_and_validate_arms` | Inspect both arms before allowing the experiment to start. | Connects both buses, verifies calibration and passive torque state, and returns the validated follower snapshot. |
+| `prepare_follower_at_operational_home` | Get permission, power the follower carefully, and move it to the starting line. | Owns startup authorization, goal alignment, torque enablement, rate-limited home movement, and the resulting measurement. |
+| `run_pose_validation_trial` | Preview, authorize, measure, and reset one named pose. | Owns one complete trial while recording its result before leader torque release. |
+| `run_teleoperation_validation` | Conduct the three-phase validation and publish its final receipt. | Orchestrates preflight, startup, three pose trials, top-level status, and shutdown policy. |
 
 ### Python execution and exception flow
 
@@ -156,12 +159,14 @@ and searches backward through those callers for a matching handler.
 module entrypoint
         ↓ calls
 run_teleoperation_validation
-        ↓ calls
-cleanup_connected_arms
-        ↓ calls
-ArmLifecycle.disable_torque_if_required
-        ↓ calls
-bus.disable_torque
+        ├─ connect_and_validate_arms
+        ├─ prepare_follower_at_operational_home
+        ├─ run_pose_validation_trial (once per named pose)
+        └─ finally: cleanup_connected_arms
+                       ↓ calls
+                 ArmLifecycle.disable_torque_if_required
+                       ↓ calls
+                 bus.disable_torque
 
 An uncaught exception travels back up this stack in the opposite direction.
 ```

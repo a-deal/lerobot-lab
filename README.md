@@ -99,8 +99,10 @@ the module-level safety boundary and verify the hardware setup first.
   teleoperation-validation runner.
 - Per-arm lifecycle objects for goal alignment, conservative torque-cleanup
   obligations, and independently attempted multi-arm cleanup.
-- Twenty-six passing SO-101 software-contract tests at the current
-  hardware-free checkpoint: eleven mapper tests and fifteen runner/lifecycle
+- Named connection-preflight, authorized follower-startup, and single-pose
+  validation phases coordinated by the top-level workflow.
+- Twenty-nine passing SO-101 software-contract tests at the current
+  hardware-free checkpoint: eleven mapper tests and eighteen workflow/lifecycle
   tests.
 
 Generated checkpoints, videos, datasets, logs, and local environments are
@@ -118,8 +120,10 @@ deliberately staged:
    named `JointTarget` receipts.
 5. **Complete:** remove the three-parallel-dictionary compatibility layer.
 6. **Complete:** extract and integrate per-arm torque lifecycle ownership.
-7. **Pending:** exercise the complete interactive runner without hardware.
-8. **Pending:** run and evaluate the bounded physical three-pose validation.
+7. **Complete:** extract connection preflight, authorized follower startup, and
+   one complete pose-validation trial as named workflow phases.
+8. **Pending:** exercise the complete interactive runner without hardware.
+9. **Pending:** run and evaluate the bounded physical three-pose validation.
 
 The current software boundary is stable: the runner orchestrates the session,
 the lifecycle objects own single-arm torque transitions, and the mapper owns
