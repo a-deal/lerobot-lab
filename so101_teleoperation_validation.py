@@ -927,6 +927,7 @@ def run_teleoperation_validation() -> int:
             "signs": SIGNS,
         },
         "poses": [],
+        "phases_completed": [],
         "csv_path": str(csv_path),
         "summary_path": str(summary_path),
     }
@@ -940,6 +941,7 @@ def run_teleoperation_validation() -> int:
                 leader_lifecycle=leader_lifecycle,
                 follower_lifecycle=follower_lifecycle,
             )
+            receipt["phases_completed"].append("connection_preflight")
 
             print(
                 json.dumps(
@@ -960,6 +962,7 @@ def run_teleoperation_validation() -> int:
                 period_s=args.period_s,
                 max_step=args.max_step,
             )
+            receipt["phases_completed"].append("follower_startup")
             commanded = home_snapshot.commanded
             receipt["home_observed"] = home_snapshot.observed
 
@@ -981,6 +984,7 @@ def run_teleoperation_validation() -> int:
             )
             leader_baseline = read_positions(leader.bus)
             receipt["leader_baseline"] = leader_baseline
+            receipt["phases_completed"].append("leader_baseline")
             print(
                 json.dumps(
                     {"stage": "baseline_captured", "leader_baseline": leader_baseline},
@@ -1005,6 +1009,7 @@ def run_teleoperation_validation() -> int:
                     max_step=args.max_step,
                     hold_s=args.hold_s,
                 )
+                receipt["phases_completed"].append(f"pose_trial:{pose_name}")
             receipt["status"] = "completed"
     except UserAbort as exc:
         receipt["status"] = "operator_aborted"
@@ -1036,6 +1041,8 @@ def run_teleoperation_validation() -> int:
 
         if cleanup_errors:
             record_cleanup_errors(receipt, cleanup_errors)
+        else:
+            receipt["phases_completed"].append("cleanup")
 
         summary_path.write_text(
             json.dumps(receipt, indent=2, sort_keys=True) + "\n",

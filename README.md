@@ -101,8 +101,8 @@ the module-level safety boundary and verify the hardware setup first.
   obligations, and independently attempted multi-arm cleanup.
 - Named connection-preflight, authorized follower-startup, and single-pose
   validation phases coordinated by the top-level workflow.
-- Twenty-nine passing SO-101 software-contract tests at the current
-  hardware-free checkpoint: eleven mapper tests and eighteen workflow/lifecycle
+- Thirty passing SO-101 software-contract tests at the current hardware-free
+  checkpoint: eleven mapper tests and nineteen workflow/lifecycle
   tests.
 
 Generated checkpoints, videos, datasets, logs, and local environments are
@@ -122,7 +122,8 @@ deliberately staged:
 6. **Complete:** extract and integrate per-arm torque lifecycle ownership.
 7. **Complete:** extract connection preflight, authorized follower startup, and
    one complete pose-validation trial as named workflow phases.
-8. **Pending:** exercise the complete interactive runner without hardware.
+8. **Complete:** exercise the complete interactive workflow through a
+   hardware-free orchestrator test.
 9. **Pending:** run and evaluate the bounded physical three-pose validation.
 
 The current software boundary is stable: the runner orchestrates the session,

@@ -27,10 +27,12 @@ the public harness function, then verify both the mapper call and returned
 contract.
 """
 
-from __future__ import annotations
-
+import json
 import unittest
-from typing import Literal
+from pathlib import Path
+from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from typing import Any, Literal
 from unittest.mock import Mock, call, patch
 
 from so101_lifecycle import ArmLifecycle
@@ -38,7 +40,10 @@ from so101_mapping import JointTarget
 from so101_teleoperation_validation import (
     HOME,
     JOINTS,
+    POSE_NAMES,
     UNPOWERED_REST,
+    OperationalHomeSnapshot,
+    PreflightSnapshot,
     UserAbort,
     approach_and_hold,
     build_pose_preview,
@@ -50,6 +55,7 @@ from so101_teleoperation_validation import (
     prepare_follower_at_operational_home,
     record_cleanup_errors,
     run_pose_validation_trial,
+    run_teleoperation_validation,
     target_log_fields,
     write_cycle_rows,
 )
@@ -532,6 +538,151 @@ class MappingAdapterTests(unittest.TestCase):
         follower_bus.sync_write.assert_not_called()
 
         self.assertEqual(pose_results, [])
+
+    def test_happy_path_records_completed_orchestration_phases(self) -> None:
+        """The real orchestrator sequences specialists and records each success."""
+
+        follower_present = {joint: 0.0 for joint in JOINTS}
+        follower_torque = {joint: 0 for joint in JOINTS}
+        leader_baseline = {joint: 10.0 for joint in JOINTS}
+
+        preflight_snapshot = PreflightSnapshot(
+            follower_present=follower_present,
+            follower_torque=follower_torque,
+        )
+        home_snapshot = OperationalHomeSnapshot(
+            commanded=dict(HOME),
+            observed=dict(HOME),
+        )
+
+        leader = Mock()
+        leader.bus = Mock()
+        follower = Mock()
+        follower.bus = Mock()
+
+        def complete_trial(**kwargs: Any) -> dict[str, float]:
+            """Simulate one successful trial using its real public contract."""
+
+            pose_name = kwargs["pose_name"]
+            kwargs["pose_results"].append({"pose": pose_name, "status": "completed"})
+
+            next_commanded = dict(kwargs["commanded"])
+            next_commanded[JOINTS[0]] += 1.0
+            return next_commanded
+
+        with TemporaryDirectory() as output_dir:
+            args = SimpleNamespace(
+                self_test=False,
+                period_s=0.1,
+                max_step=2.0,
+                hold_s=0.1,
+                output_dir=output_dir,
+                leader_port="mock-leader-port",
+                follower_port="mock-follower-port",
+                leader_id="mock-leader",
+                follower_id="mock-follower",
+            )
+
+            with (
+                patch(
+                    "so101_teleoperation_validation.parse_args",
+                    return_value=args,
+                ),
+                patch(
+                    "so101_teleoperation_validation.SO101Leader",
+                    return_value=leader,
+                ),
+                patch(
+                    "so101_teleoperation_validation.SO101Follower",
+                    return_value=follower,
+                ),
+                patch(
+                    "so101_teleoperation_validation.connect_and_validate_arms",
+                    return_value=preflight_snapshot,
+                ) as preflight,
+                patch(
+                    "so101_teleoperation_validation.prepare_follower_at_operational_home",
+                    return_value=home_snapshot,
+                ) as startup,
+                patch(
+                    "so101_teleoperation_validation.read_positions",
+                    return_value=leader_baseline,
+                ) as read_baseline,
+                patch(
+                    "so101_teleoperation_validation.run_pose_validation_trial",
+                    side_effect=complete_trial,
+                ) as trial,
+                patch(
+                    "so101_teleoperation_validation.cleanup_connected_arms",
+                    return_value=[],
+                ) as cleanup,
+                patch("builtins.input", return_value="") as operator_input,
+                patch("builtins.print"),
+            ):
+                phase_calls = Mock()
+                phase_calls.attach_mock(preflight, "preflight")
+                phase_calls.attach_mock(startup, "startup")
+                phase_calls.attach_mock(read_baseline, "baseline")
+                phase_calls.attach_mock(trial, "trial")
+                phase_calls.attach_mock(cleanup, "cleanup")
+
+                exit_code = run_teleoperation_validation()
+                self.assertEqual(exit_code, 0)
+            operator_input.assert_called_once()
+
+            self.assertEqual(
+                [record[0] for record in phase_calls.mock_calls],
+                [
+                    "preflight",
+                    "startup",
+                    "baseline",
+                    "trial",
+                    "trial",
+                    "trial",
+                    "cleanup",
+                ],
+            )
+
+            # Preflight state must become startup input.
+            self.assertEqual(
+                startup.call_args.kwargs["starting_pose"],
+                follower_present,
+            )
+
+            # The orchestrator must execute the canonical three-pose order.
+            self.assertEqual(
+                [record.kwargs["pose_name"] for record in trial.call_args_list],
+                list(POSE_NAMES),
+            )
+
+            # Each trial must receive the command returned by the prior trial.
+            self.assertEqual(
+                [
+                    record.kwargs["commanded"][JOINTS[0]]
+                    for record in trial.call_args_list
+                ],
+                [HOME[JOINTS[0]] + offset for offset in range(3)],
+            )
+
+            summary_paths = list(Path(output_dir).glob("*_summary.json"))
+            self.assertEqual(len(summary_paths), 1)
+            receipt = json.loads(summary_paths[0].read_text(encoding="utf-8"))
+
+            self.assertEqual(receipt["status"], "completed")
+            self.assertEqual(
+                receipt["phases_completed"],
+                [
+                    "connection_preflight",
+                    "follower_startup",
+                    "leader_baseline",
+                    *[f"pose_trial:{pose_name}" for pose_name in POSE_NAMES],
+                    "cleanup",
+                ],
+            )
+            self.assertEqual(
+                [pose["pose"] for pose in receipt["poses"]],
+                list(POSE_NAMES),
+            )
 
 
 if __name__ == "__main__":
