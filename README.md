@@ -11,10 +11,13 @@ This is a **lab containing several small workflows**, not one application with
 one universal `main.py`.
 
 In Python, `main.py` is a convention, not a requirement. Any file can be an
-executable entrypoint. `so101_pose_fidelity.py` contains its own `main()` and
-can be executed directly. `inspect_sample.py` is another standalone script.
-`so101_mapping.py` is different: it is a library module imported by other code
-and cannot run hardware.
+executable entrypoint. `run_so101_teleoperation_validation.py` contains its own
+workflow function and can be executed directly. `inspect_sample.py` is another
+standalone script.
+
+`so101_mapping.py` and `so101_lifecycle.py` are library modules imported by the
+runner. The mapper is hardware-free; the lifecycle module wraps one arm's bus
+to own goal-alignment, torque transitions, and cleanup obligation state.
 
 The training workflow begins with `run-first-train.sh`. That file is a shell
 script, not Python. It configures the local environment and calls
@@ -39,10 +42,11 @@ run-first-train.sh
   -> writes generated checkpoints and logs under outputs/
 
 
-Lane B: SO-101 leader/follower measurement
+Lane B: SO-101 leader/follower teleoperation validation
 
-so101_pose_fidelity.py                    executable experiment entrypoint
+run_so101_teleoperation_validation.py     executable validation entrypoint
   -> imports so101_mapping.py             pure translation library
+  -> imports so101_lifecycle.py           per-arm torque lifecycle
   -> imports LeRobot SO-101 drivers       hardware communication
   -> reads leader and follower state
   -> previews and operator-gates targets
@@ -52,21 +56,23 @@ so101_pose_fidelity.py                    executable experiment entrypoint
 tests/test_so101_mapping.py
   -> proves pure mapping behavior with ordinary numbers
 
-tests/test_so101_pose_fidelity.py
-  -> proves the harness-to-mapper software boundary without hardware
+tests/test_so101_teleoperation_validation.py
+  -> proves harness, lifecycle, and cleanup contracts without hardware
 ```
 
 The dependency direction is deliberate:
 
 ```text
-SO-101 hardware harness -> pure mapping module
-tests                  -> public functions in both modules
+teleoperation runner -> pure mapping module
+                     -> per-arm lifecycle -> LeRobot bus
+tests                -> public functions in all three modules
 
-pure mapping module    -X-> hardware harness
+pure mapping module  -X-> lifecycle, hardware, or runner
 ```
 
-The mapper must never import the harness or hardware drivers. That one-way
-dependency keeps its numerical rules cheap and safe to test.
+The mapper must never import lifecycle, the runner, or hardware drivers. The
+lifecycle module must not import the runner. Those one-way dependencies keep
+target math hardware-free and prevent circular ownership.
 
 ## Entrypoints and commands
 
@@ -76,8 +82,8 @@ dependency keeps its numerical rules cheap and safe to test.
 | Train the first local PushT ACT policy | `run-first-train.sh` | `./run-first-train.sh` | No |
 | Test the pure mapper | Python unittest discovery | `./.venv/bin/python -m unittest discover -s tests -p 'test_so101_mapping.py' -v` | No |
 | Test all SO-101 software contracts | Python unittest discovery | `./.venv/bin/python -m unittest discover -s tests -p 'test_so101*.py' -v` | No |
-| Smoke-test the harness integration | `so101_pose_fidelity.py` | `./.venv/bin/python so101_pose_fidelity.py --self-test` | No |
-| Run the physical three-pose experiment | `so101_pose_fidelity.py` | `./.venv/bin/python so101_pose_fidelity.py` with verified ports and setup | Yes |
+| Smoke-test the harness integration | `run_so101_teleoperation_validation.py` | `./.venv/bin/python run_so101_teleoperation_validation.py --self-test` | No |
+| Run the physical three-pose validation | `run_so101_teleoperation_validation.py` | `./.venv/bin/python run_so101_teleoperation_validation.py` with verified ports and setup | Yes |
 
 Do not run the physical command merely because the software tests pass. Read
 the module-level safety boundary and verify the hardware setup first.
@@ -88,9 +94,12 @@ the module-level safety boundary and verify the hardware setup first.
 - PushT dataset inspection and a local 5,000-step ACT training run.
 - A persistent six-joint SO-101 relative-teleoperation harness.
 - A hardware-free leader-to-follower mapping module integrated into the live
-  pose-fidelity harness.
-- Thirteen passing SO-101 software-contract tests at the last committed green
-  checkpoint: eleven mapper tests and two harness-boundary tests.
+  teleoperation-validation runner.
+- Per-arm lifecycle objects for goal alignment, conservative torque-cleanup
+  obligations, and independently attempted multi-arm cleanup.
+- Twenty-six passing SO-101 software-contract tests at the current
+  hardware-free checkpoint: eleven mapper tests and fifteen runner/lifecycle
+  tests.
 
 Generated checkpoints, videos, datasets, logs, and local environments are
 deliberately excluded from Git.
@@ -103,14 +112,16 @@ deliberately staged:
 1. **Complete:** isolate and test leader-to-follower mapping.
 2. **Complete:** make the legacy harness call that mapper.
 3. **Complete:** expose `dict[str, JointTarget]` as the clean harness boundary.
-4. **In progress:** migrate preview, motion, logging, and evaluation consumers
-   away from three parallel dictionaries.
-5. **Pending:** delete the legacy adapter after all consumers and replacement
-   tests are green.
-6. **Pending:** run and evaluate the bounded physical three-pose experiment.
+4. **Complete:** migrate preview, motion, logging, and evaluation consumers to
+   named `JointTarget` receipts.
+5. **Complete:** remove the three-parallel-dictionary compatibility layer.
+6. **Complete:** extract and integrate per-arm torque lifecycle ownership.
+7. **Pending:** exercise the complete interactive runner without hardware.
+8. **Pending:** run and evaluate the bounded physical three-pose validation.
 
-The immediate exercise migrates only the no-motion preview. Keeping motion and
-logging unchanged gives each contract change one clear failure surface.
+The current software boundary is stable: the runner orchestrates the session,
+the lifecycle objects own single-arm torque transitions, and the mapper owns
+hardware-free target math.
 
 ## Pure SO-101 mapping layer
 
@@ -147,11 +158,14 @@ Expect it to be slow on MPS. The point is not a SOTA policy, it's watching loss 
 
 - `so101_mapping.py`: importable pure coordinate-mapping and evaluation
   library; never commands hardware.
-- `so101_pose_fidelity.py`: executable, operator-gated physical experiment and
-  hardware-free self-test; contains the SO-101 workflow's `main()`.
+- `so101_lifecycle.py`: one arm's goal-alignment ordering, torque transitions,
+  and conservative software cleanup obligation.
+- `run_so101_teleoperation_validation.py`: executable, operator-gated physical
+  validation and hardware-free self-test; contains the SO-101 workflow's
+  `run_teleoperation_validation()` function.
 - `tests/test_so101_mapping.py`: pure mapping unit and six-joint contracts.
-- `tests/test_so101_pose_fidelity.py`: hardware-free harness integration and
-  migration contracts.
+- `tests/test_so101_teleoperation_validation.py`: hardware-free runner,
+  lifecycle, cleanup, and mapping-integration contracts.
 - `inspect_sample.py`: standalone PushT dataset-inspection entrypoint.
 - `run-first-train.sh`: shell entrypoint that invokes LeRobot's training CLI.
 - `docs/`: deeper concept and implementation reference; modules and this
@@ -161,12 +175,14 @@ Expect it to be slow on MPS. The point is not a SOTA policy, it's watching loss 
 ## Reading order for the current SO-101 work
 
 1. Read this README for repository and workflow taxonomy.
-2. Read the top of `so101_pose_fidelity.py` for the live experiment boundary
-   and migration status.
-3. Read the top of `so101_mapping.py` for the pure translator contract.
-4. Read `tests/test_so101_pose_fidelity.py` to see the current handoff examples.
-5. Read `tests/test_so101_mapping.py` for the mapper's numerical edge cases.
-6. Use `docs/so101-mapping-learning-guide.md` only when deeper terminology or
+2. Read the top of `run_so101_teleoperation_validation.py` for the live
+   validation boundary and orchestration flow.
+3. Read `so101_lifecycle.py` for per-arm torque state transitions.
+4. Read the top of `so101_mapping.py` for the pure translator contract.
+5. Read `tests/test_so101_teleoperation_validation.py` for lifecycle, cleanup,
+   and harness handoffs.
+6. Read `tests/test_so101_mapping.py` for the mapper's numerical edge cases.
+7. Use `docs/so101-mapping-learning-guide.md` only when deeper terminology or
    historical implementation sequence is useful.
 
 ## Notes

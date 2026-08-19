@@ -76,7 +76,7 @@ It makes the live harness depend on the already-tested mapper.
 The bounded definition of done is:
 
 1. integrate one existing pure module, `so101_mapping.py`, into one existing
-   hardware harness, `so101_pose_fidelity.py`;
+   hardware harness, `run_so101_teleoperation_validation.py`;
 2. add one hardware-free adapter test;
 3. keep all eleven pure-mapper tests green;
 4. make the one adapter test green;
@@ -89,35 +89,38 @@ If this turns green, the next stage is a separate refactor that carries
 three-dictionary compatibility layer. Keeping those stages separate tells us
 whether a failure came from connecting the mapper or redesigning consumers.
 
+**Current status:** those consumer migrations are complete. A later bounded
+refactor added `so101_lifecycle.py`, which now owns each arm's goal-alignment
+and torque-cleanup transitions. The sequence below preserves the original
+mapping exercise while the architecture notes describe the current boundary.
+
 ### Module and call-chain map
 
 ```text
 leader positions captured by the hardware harness
                     ↓
-calculate_targets adapter in so101_pose_fidelity.py
+calculate_targets adapter in run_so101_teleoperation_validation.py
                     ↓
 map_pose_relative in so101_mapping.py
                     ↓
 dict[joint name, JointTarget]
                     ↓
-temporary adapter unpacking
-                    ↓
-legacy raw, bounded, and clipped dictionaries
-                    ↓
-existing preview, command, logging, and evaluation code
+preview, command, logging, and evaluation consumers
 ```
 
 `so101_mapping.py` is the translator. It owns validation and target math but
-must remain unable to touch hardware. `so101_pose_fidelity.py` is the
-experiment conductor. It owns hardware reads, command timing, torque,
-operator gates, evidence, and cleanup.
+must remain unable to touch hardware. `so101_lifecycle.py` owns each arm's
+goal-alignment ordering and torque-cleanup obligation.
+`run_so101_teleoperation_validation.py` conducts the validation. It owns
+hardware reads, command timing, operator gates, multi-arm cleanup, evidence,
+and receipt policy.
 
 ### Legacy surface versus new surface
 
 | Surface | Status | Meaning | Removal condition |
 |---|---|---|---|
-| `raw`, `bounded`, `clipped` parallel dictionaries | Legacy compatibility layer | Three separately keyed views used throughout the current harness | Remove after every consumer accepts `JointTarget` values directly and equivalent tests pass. |
-| `clipped` boolean name | Legacy vocabulary | Whether an absolute bound altered a raw target | Replace with the mapper's `saturated` field during the consumer migration. |
+| `raw`, `bounded`, `clipped` parallel dictionaries | Removed compatibility layer | Three separately keyed views formerly used by the harness | Removal condition satisfied after every consumer accepted `JointTarget` values directly. |
+| `clipped` boolean name | Removed legacy vocabulary | Former name for whether an absolute bound altered a raw target | Replaced by the mapper's `saturated` field. |
 | `JointMapping` configuration objects | New contract | One named instruction card per joint | Retain unless a later strategy requires a different mapping model. |
 | `JointTarget` result objects | New contract | Raw proposal, allowed value, and saturation evidence kept together | Carry end-to-end through preview, logging, command, and evaluation code. |
 | `map_pose_relative` | New calculation owner | Validates and maps a complete named joint configuration | Retain as the single affine-mapping implementation. |
@@ -130,7 +133,7 @@ operator gates, evidence, and cleanup.
 | `utc_now` | Put the current clock time on the receipt. | Supplies comparable wall-clock timestamps. |
 | `read_positions` | Ask all six joints where they are and reject an incomplete answer. | Reads normalized hardware state and validates names and finite values. |
 | harness `clamp` | Take only one small step even when the destination is far away. | Supports command rate limiting; it is separate from target-bound clamping. |
-| `calculate_targets` | Plug the new translator into the old harness socket. | Calls `map_pose_relative`, then temporarily unpacks each `JointTarget` into the legacy dictionaries. |
+| `calculate_joint_targets` | Ask the pure translator for one receipt per joint. | Calls `map_pose_relative` and preserves the returned `JointTarget` objects. |
 | `next_commands` | Move each command a little closer to its destination. | Applies the per-cycle maximum-step limit. |
 | `write_cycle_rows` | Write down what every joint was asked to do and what it actually did. | Produces the detailed CSV evidence. |
 | `approach_and_hold` | Walk to the target carefully, stay there briefly, and measure the result. | Owns the control loop, hold window, measurements, and per-pose summary. |
@@ -138,7 +141,8 @@ operator gates, evidence, and cleanup.
 | `prompt_visual_judgment` | Ask the human whether the physical shapes looked alike. | Captures a manual evaluation label. |
 | `run_self_test` | Rehearse the arithmetic with pretend numbers and no robot. | Provides a quick hardware-free integration smoke test. |
 | `parse_args` | Read the operator's command-line settings. | Builds the runtime configuration. |
-| `main` | Conduct the entire experiment from connection through cleanup. | Owns serial connection, torque lifecycle, operator gates, trials, receipts, and shutdown. |
+| `ArmLifecycle` | Keep one arm's torque-cleanup sticky note with its bus. | Owns goal alignment, torque transitions, and the conservative cleanup obligation. |
+| `run_teleoperation_validation` | Conduct the entire validation from connection through cleanup. | Owns serial connection, lifecycle coordination, operator gates, trials, receipts, and shutdown. |
 
 ### Python execution and exception flow
 
@@ -151,9 +155,11 @@ and searches backward through those callers for a matching handler.
 ```text
 module entrypoint
         ↓ calls
-main
+run_teleoperation_validation
         ↓ calls
 cleanup_connected_arms
+        ↓ calls
+ArmLifecycle.disable_torque_if_required
         ↓ calls
 bus.disable_torque
 
@@ -182,14 +188,16 @@ policy decision:
 - do not catch when a higher caller is the first layer that can make a useful
   decision.
 
-`cleanup_connected_arms` uses the second pattern. Each applicable torque-off
-or disconnect attempt has its own exception boundary. A failure becomes a
-labeled string in `cleanup_errors`, and the helper continues trying the other
-independent cleanup actions. This is best-effort continuation, not proof that
-torque was physically disabled or that either arm reached a safe pose.
+`cleanup_connected_arms` uses the second pattern. It asks each connected
+`ArmLifecycle` to discharge its torque obligation, then attempts each
+disconnect. Every arm/action pair has its own exception boundary. A failure
+becomes a labeled string in `cleanup_errors`, and the helper continues trying
+the other independent cleanup actions. This is best-effort continuation, not
+proof that torque was physically disabled or that either arm reached a safe
+pose.
 
-`main` owns the top-level outcome. Its receipt and process behavior follow this
-contract:
+`run_teleoperation_validation` owns the top-level outcome. Its receipt and
+process behavior follow this contract:
 
 | Experiment body | Cleanup | Receipt status | Process behavior |
 |---|---|---|---|
@@ -198,9 +206,9 @@ contract:
 | operator abort or handled interrupt | any cleanup result | preserve the earlier status and attach any `cleanup_errors` | return `1` |
 | raises an unexpected `Exception` | any cleanup result | `failed`, original `error`, plus any `cleanup_errors` | write the receipt, then re-raise the original exception |
 
-The unexpected-exception handler in `main` records the primary experiment
+The unexpected-exception handler in `run_teleoperation_validation` records the primary experiment
 failure and uses bare `raise`. The outer `finally` then runs cleanup and writes
-the receipt before that original exception leaves `main`. The cleanup error is
+the receipt before that original exception leaves the function. The cleanup error is
 not hidden: it remains in the receipt as secondary evidence. The compact
 shutdown message prints the final status and receipt path; the receipt file is
 the complete record.
@@ -212,7 +220,8 @@ success = experiment completed AND required cleanup reported no errors
 ```
 
 When this module is imported by a unit test, Python defines its functions but
-does not run `main` because `__name__ != "__main__"`. The cleanup unit test can
+does not run `run_teleoperation_validation` because `__name__ != "__main__"`.
+The cleanup unit test can
 therefore inject failures into mock buses without connecting hardware. Its
 current leader-torque-failure case proves that the expected calls are attempted
 and later disconnect cleanup continues; it does not prove physical shutdown or

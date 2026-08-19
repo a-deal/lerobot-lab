@@ -1,5 +1,4 @@
-#!/usr/bin/env python3
-"""Conduct a bounded three-pose SO-101 leader/follower fidelity experiment.
+"""Run a bounded three-pose SO-101 leader/follower teleoperation validation.
 
 Where this module sits
 ----------------------
@@ -7,11 +6,14 @@ Where this module sits
 The human moves the passive leader. This module reads that joint configuration,
 asks ``so101_mapping`` for follower targets, previews the proposed movement,
 and moves the powered follower only after explicit operator authorization.
+After capture, the harness aligns and enables leader torque temporarily so the
+comparison pose cannot collapse while the follower moves.
 
 ``so101_mapping`` is the translator. It owns input validation and target math
-but cannot touch hardware. This module is the experiment conductor. It owns
-serial connections, torque lifecycle, incremental commands, human gates,
-measurements, evidence files, and shutdown.
+but cannot touch hardware. ``so101_lifecycle`` owns each arm's goal-alignment
+and torque transitions. This module conducts the validation. It owns serial
+connections, multi-arm cleanup orchestration, incremental commands, human
+gates, measurements, evidence files, and shutdown policy.
 
 This is intentionally not free-running teleoperation. Each pose is captured
 once, previewed, explicitly authorized, approached through rate-limited
@@ -50,7 +52,8 @@ Read the functions in this order
 7. ``approach_and_hold`` executes and evaluates one authorized pose.
 8. ``write_cycle_rows`` records the detailed evidence.
 9. ``move_home`` restores the common follower anchor.
-10. ``main`` connects those pieces into the complete operator-gated experiment.
+10. ``run_teleoperation_validation`` connects those pieces into the complete
+    operator-gated validation.
 """
 
 from __future__ import annotations
@@ -67,13 +70,14 @@ from typing import Any
 
 from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
 from lerobot.teleoperators.so101_leader import SO101Leader, SO101LeaderConfig
+
+from so101_lifecycle import ArmLifecycle
 from so101_mapping import (
     JointMapping,
     JointTarget,
     final_pose_error,
     map_pose_relative,
 )
-
 
 JOINTS = (
     "shoulder_pan",
@@ -95,11 +99,23 @@ HOME = {
     "gripper": 30.92425295343989,
 }
 
+# This is the arm's only stable unpowered posture without an external cradle.
+# It is a recognition reference, never a commanded destination: shoulder lift
+# and elbow flex rest beyond the experiment's normal absolute motion margins.
+UNPOWERED_REST = {
+    "shoulder_pan": 3.056426332288396,
+    "shoulder_lift": -91.9496855345912,
+    "elbow_flex": 100.0,
+    "wrist_flex": 4.416961130742052,
+    "wrist_roll": 0.6664889362836561,
+    "gripper": 31.13273106323836,
+}
+START_REST_TOLERANCE = 8.0
+
 # These are conservative absolute coordinate margins.  They are not a motion
 # plan and do not imply that every six-joint combination inside them is safe.
 ABSOLUTE_BOUNDS = {
-    joint: ((5.0, 95.0) if joint == "gripper" else (-80.0, 80.0))
-    for joint in JOINTS
+    joint: ((5.0, 95.0) if joint == "gripper" else (-80.0, 80.0)) for joint in JOINTS
 }
 GAINS = {joint: 1.0 for joint in JOINTS}
 OFFSETS = {joint: 0.0 for joint in JOINTS}
@@ -167,7 +183,9 @@ def read_positions(bus: Any) -> dict[str, float]:
     }
     missing = [joint for joint in JOINTS if joint not in positions]
     nonfinite = [
-        joint for joint in JOINTS if joint in positions and not math.isfinite(positions[joint])
+        joint
+        for joint in JOINTS
+        if joint in positions and not math.isfinite(positions[joint])
     ]
     if missing or nonfinite:
         raise RuntimeError(
@@ -185,6 +203,33 @@ def clamp(value: float, low: float, high: float) -> float:
     """
 
     return max(low, min(high, value))
+
+
+def pose_within_tolerance(
+    measured: dict[str, float],
+    reference: dict[str, float],
+    tolerance: float,
+) -> bool:
+    """Return whether every measured joint is near one complete reference.
+
+    This recognizes a known startup state; it does not declare that state safe
+    to command. Exact joint sets prevent a partial sensor read from looking
+    like a valid rest pose.
+    """
+    expected_joints = set(JOINTS)
+
+    if (
+        set(measured) != expected_joints
+        or set(reference) != expected_joints
+        or tolerance < 0
+    ):
+        return False
+    return all(
+        math.isfinite(measured[joint])
+        and math.isfinite(reference[joint])
+        and abs(measured[joint] - reference[joint]) <= tolerance
+        for joint in reference
+    )
 
 
 def calculate_joint_targets(
@@ -230,21 +275,11 @@ def build_pose_preview(
         "stage": "pose_preview_no_motion",
         "pose": pose_name,
         "leader_delta": {
-            joint: leader_captured[joint] - leader_baseline[joint]
-            for joint in JOINTS
+            joint: leader_captured[joint] - leader_baseline[joint] for joint in JOINTS
         },
-        "raw_target": {
-            joint: targets[joint].raw
-            for joint in JOINTS
-        },
-        "bounded_target": {
-            joint: targets[joint].bounded
-            for joint in JOINTS
-        },
-        "absolute_clipped": {
-            joint: targets[joint].saturated
-            for joint in JOINTS
-        },
+        "raw_target": {joint: targets[joint].raw for joint in JOINTS},
+        "bounded_target": {joint: targets[joint].bounded for joint in JOINTS},
+        "absolute_clipped": {joint: targets[joint].saturated for joint in JOINTS},
     }
 
 
@@ -281,26 +316,17 @@ def build_pose_result_record(
 
     The live loop gathers the inputs, but this hardware-free function owns the
     output contract. Keeping summary construction testable prevents a deleted
-    compatibility variable from surviving unnoticed in ``main`` after the
-    robot has already moved.
+    compatibility variable from surviving unnoticed in
+    ``run_teleoperation_validation`` after the robot has already moved.
     """
 
     return {
         **pose_result,
         "name": pose_name,
         "leader_captured": leader_captured,
-        "raw_targets": {
-            joint: targets[joint].raw
-            for joint in JOINTS
-        },
-        "bounded_targets": {
-            joint: targets[joint].bounded
-            for joint in JOINTS
-        },
-        "absolute_clipped": {
-            joint: targets[joint].saturated
-            for joint in JOINTS
-        },
+        "raw_targets": {joint: targets[joint].raw for joint in JOINTS},
+        "bounded_targets": {joint: targets[joint].bounded for joint in JOINTS},
+        "absolute_clipped": {joint: targets[joint].saturated for joint in JOINTS},
         "visual_judgment": visual_judgment,
     }
 
@@ -372,8 +398,7 @@ def write_cycle_rows(
                 "rate_limited": int(rate_limited[joint]),
                 "follower_measured": follower_measured[joint],
                 "command_error": commanded[joint] - follower_measured[joint],
-                "raw_target_error": joint_targets[joint].raw
-                - follower_measured[joint],
+                "raw_target_error": joint_targets[joint].raw - follower_measured[joint],
                 "cycle_duration_s": cycle_duration_s,
             }
         )
@@ -403,16 +428,15 @@ def approach_and_hold(
     physical path or pose is collision-free.
     """
 
-    bounded_targets = {
-        joint: joint_targets[joint].bounded
-        for joint in JOINTS
-    }
+    bounded_targets = {joint: joint_targets[joint].bounded for joint in JOINTS}
     cycle = 0
     approach_start = time.monotonic()
     rate_limited_cycles = {joint: 0 for joint in JOINTS}
     max_tracking_error = {joint: 0.0 for joint in JOINTS}
 
-    while max(abs(commanded[joint] - bounded_targets[joint]) for joint in JOINTS) > 0.05:
+    while (
+        max(abs(commanded[joint] - bounded_targets[joint]) for joint in JOINTS) > 0.05
+    ):
         cycle_start = time.monotonic()
         leader_live = read_positions(leader.bus)
         commanded, rate_limited = next_commands(commanded, bounded_targets, max_step)
@@ -479,13 +503,14 @@ def approach_and_hold(
             time.sleep(remaining)
 
     final_measured = read_positions(follower.bus)
+    leader_final_measured = read_positions(leader.bus)
+
     final_error = final_pose_error(
         targets=joint_targets,
         follower_measured=final_measured,
     )
     leader_drift = {
-        joint: read_positions(leader.bus)[joint] - leader_captured[joint]
-        for joint in JOINTS
+        joint: leader_final_measured[joint] - leader_captured[joint] for joint in JOINTS
     }
     result = {
         "approach_seconds": reached_command_at - approach_start,
@@ -495,6 +520,7 @@ def approach_and_hold(
         "max_tracking_error": max_tracking_error,
         "final_measured": final_measured,
         "final_signed_error": final_error,
+        "leader_final_measured": leader_final_measured,
         "leader_end_drift": leader_drift,
     }
     return commanded, result
@@ -520,9 +546,13 @@ def prompt_visual_judgment() -> str:
     """Collect the operator's physical-pose label using fixed vocabulary."""
 
     while True:
-        answer = input(
-            "While the follower holds: type MATCH, MISMATCH, or UNCLEAR for the physical pose.\n"
-        ).strip().upper()
+        answer = (
+            input(
+                "While the follower holds: type MATCH, MISMATCH, or UNCLEAR for the physical pose.\n"
+            )
+            .strip()
+            .upper()
+        )
         if answer in {"MATCH", "MISMATCH", "UNCLEAR"}:
             return answer.lower()
         print("Expected MATCH, MISMATCH, or UNCLEAR.", flush=True)
@@ -561,7 +591,7 @@ def parse_args() -> argparse.Namespace:
     """Build and parse the command-line configuration for one run."""
 
     parser = argparse.ArgumentParser(
-        description="Run three explicitly approved, held SO-101 pose-fidelity measurements."
+        description="Run three explicitly approved SO-101 teleoperation-validation measurements."
     )
     parser.add_argument("--leader-port", default="/dev/cu.usbmodem5C4C1284061")
     parser.add_argument("--follower-port", default="/dev/cu.usbmodem5C4C1248501")
@@ -581,52 +611,42 @@ def parse_args() -> argparse.Namespace:
 
 def cleanup_connected_arms(
     *,
-    leader_bus: Any,
-    follower_bus: Any,
-    leader_torque_owned: bool,
-    follower_torque_owned: bool,
+    leader_lifecycle: ArmLifecycle,
+    follower_lifecycle: ArmLifecycle,
 ) -> list[str]:
     """Attempt every applicable cleanup step and return any failures."""
 
     errors: list[str] = []
-    if leader_bus.is_connected and leader_torque_owned:
-        try:
-            leader_bus.disable_torque(list(JOINTS))
-        except Exception as exc:
-            errors.append(f"leader torque-off failed: {exc}")
-    if follower_bus.is_connected and follower_torque_owned:
-        try:
-            follower_bus.disable_torque(list(JOINTS))
-        except Exception as exc:
-            errors.append(f"follower torque-off failed: {exc}")
-    if follower_bus.is_connected:
-        try:
-            follower_bus.disconnect(disable_torque=False)
-        except Exception as exc:
-            errors.append(f"follower disconnect failed: {exc}")
-    if leader_bus.is_connected:
-        try:
-            leader_bus.disconnect(disable_torque=False)
-        except Exception as exc:
-            errors.append(f"leader disconnect failed: {exc}")
 
+    for lifecycle in [leader_lifecycle, follower_lifecycle]:
+        if not lifecycle.bus.is_connected:
+            continue
+        try:
+            lifecycle.disable_torque_if_required()
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup boundary
+            errors.append(f"{lifecycle.name} torque-off failed: {exc}")
+
+    for lifecycle in [follower_lifecycle, leader_lifecycle]:
+        if not lifecycle.bus.is_connected:
+            continue
+        try:
+            lifecycle.bus.disconnect(disable_torque=False)
+        except Exception as exc:  # noqa: BLE001 - best-effort cleanup boundary
+            errors.append(f"{lifecycle.name} disconnect failed: {exc}")
     return errors
 
 
-def record_cleanup_errors(
-    receipt: dict[str, Any], cleanup_errors: list[str]
-) -> None:
-    """Attach cleanup evidence without hiding a primary experiment failure."""
-
+def record_cleanup_errors(receipt: dict[str, Any], cleanup_errors: list[str]) -> None:
+    """Record any cleanup failures in the receipt."""
     if receipt["status"] == "completed":
         receipt["status"] = "cleanup_failed"
     receipt["cleanup_errors"] = cleanup_errors
 
 
-def main() -> int:
-    """Run the operator-gated experiment and always release owned resources.
+def run_teleoperation_validation() -> int:
+    """Run the operator-gated validation and always release owned resources.
 
-    ``main`` is the only orchestration layer: it connects both arms, verifies
+    This is the only orchestration layer: it connects both arms, verifies
     torque preconditions, captures anchors and poses, authorizes movement,
     records evidence, and performs shutdown cleanup.
     """
@@ -645,12 +665,12 @@ def main() -> int:
     summary_path = output_dir / f"{stamp}_summary.json"
     process_start = time.monotonic()
 
-    leader = SO101Leader(
-        SO101LeaderConfig(port=args.leader_port, id=args.leader_id)
-    )
+    leader = SO101Leader(SO101LeaderConfig(port=args.leader_port, id=args.leader_id))
     follower = SO101Follower(
         SO101FollowerConfig(port=args.follower_port, id=args.follower_id)
     )
+    leader_lifecycle = ArmLifecycle(name="leader", bus=leader.bus, joints=JOINTS)
+    follower_lifecycle = ArmLifecycle(name="follower", bus=follower.bus, joints=JOINTS)
     receipt: dict[str, Any] = {
         "started_at": utc_now(),
         "status": "started",
@@ -672,8 +692,6 @@ def main() -> int:
         "csv_path": str(csv_path),
         "summary_path": str(summary_path),
     }
-    follower_torque_owned = False
-    leader_torque_owned = False
 
     try:
         with csv_path.open("w", newline="", encoding="utf-8") as csv_file:
@@ -692,9 +710,7 @@ def main() -> int:
 
             present = read_positions(follower.bus)
             follower_torque = {
-                joint: int(
-                    follower.bus.read("Torque_Enable", joint, normalize=False)
-                )
+                joint: int(follower.bus.read("Torque_Enable", joint, normalize=False))
                 for joint in JOINTS
             }
             if any(follower_torque.values()):
@@ -712,16 +728,34 @@ def main() -> int:
                 ),
                 flush=True,
             )
-            answer = input(
-                "Support the follower and clear its path to the known operational home. "
-                "Type HOLD to align goals, enable torque, and move home; anything else aborts.\n"
-            ).strip().upper()
-            if answer != "HOLD":
-                raise UserAbort("operator declined torque enable")
+            if pose_within_tolerance(
+                present,
+                UNPOWERED_REST,
+                START_REST_TOLERANCE,
+            ):
+                answer = (
+                    input(
+                        "Recognized the known stable unpowered rest pose. Clear the path to "
+                        "operational home and type START; anything else aborts.\n"
+                    )
+                    .strip()
+                    .upper()
+                )
+                if answer != "START":
+                    raise UserAbort("operator declined recognized-rest startup")
+            else:
+                answer = (
+                    input(
+                        "Follower is outside the known stable rest pose. Support it and clear "
+                        "the path to operational home. Type HOLD to continue; anything else aborts.\n"
+                    )
+                    .strip()
+                    .upper()
+                )
+                if answer != "HOLD":
+                    raise UserAbort("operator declined supported startup")
+            follower_lifecycle.align_goals_and_enable_torque(present)
 
-            follower.bus.sync_write("Goal_Position", present)
-            follower.bus.enable_torque(list(JOINTS))
-            follower_torque_owned = True
             time.sleep(0.4)
             commanded = move_home(
                 follower,
@@ -783,10 +817,14 @@ def main() -> int:
                             flush=True,
                         )
                         continue
-                    answer = input(
-                        "Inspect both motion envelopes. Type MOVE to execute this held pose, "
-                        "REDO to recapture, or QUIT to shut down.\n"
-                    ).strip().upper()
+                    answer = (
+                        input(
+                            "Inspect both motion envelopes. Type MOVE to execute this held pose, "
+                            "REDO to recapture, or QUIT to shut down.\n"
+                        )
+                        .strip()
+                        .upper()
+                    )
                     if answer == "REDO":
                         continue
                     if answer == "QUIT":
@@ -796,6 +834,20 @@ def main() -> int:
                         continue
                     break
 
+                leader_lifecycle.align_goals_and_enable_torque(leader_captured)
+                time.sleep(0.2)
+                print(
+                    json.dumps(
+                        {
+                            "stage": "leader_pose_hold",
+                            "pose": pose_name,
+                            "leader_captured": leader_captured,
+                            "leader_hold_observed": read_positions(leader.bus),
+                        },
+                        indent=2,
+                    ),
+                    flush=True,
+                )
                 commanded, pose_result = approach_and_hold(
                     follower=follower,
                     leader=leader,
@@ -830,6 +882,15 @@ def main() -> int:
                     visual_judgment=prompt_visual_judgment(),
                 )
                 receipt["poses"].append(pose_result)
+                leader_lifecycle.disable_torque_if_required()
+
+                print(
+                    json.dumps(
+                        {"stage": "leader_released", "pose": pose_name},
+                        indent=2,
+                    ),
+                    flush=True,
+                )
                 commanded = move_home(
                     follower,
                     commanded,
@@ -864,7 +925,10 @@ def main() -> int:
     finally:
         receipt["finished_at"] = utc_now()
 
-        if follower.bus.is_connected and follower_torque_owned:
+        if (
+            follower_lifecycle.bus.is_connected
+            and follower_lifecycle.torque_cleanup_required
+        ):
             try:
                 input(
                     "Support the follower, then press ENTER to disable torque and exit.\n"
@@ -872,10 +936,8 @@ def main() -> int:
             except (EOFError, KeyboardInterrupt):
                 print("Disabling follower torque now.", flush=True)
         cleanup_errors = cleanup_connected_arms(
-            leader_bus=leader.bus,
-            follower_bus=follower.bus,
-            leader_torque_owned=leader_torque_owned,
-            follower_torque_owned=follower_torque_owned,
+            leader_lifecycle=leader_lifecycle,
+            follower_lifecycle=follower_lifecycle,
         )
 
         if cleanup_errors:
@@ -901,4 +963,4 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    sys.exit(main())
+    sys.exit(run_teleoperation_validation())
