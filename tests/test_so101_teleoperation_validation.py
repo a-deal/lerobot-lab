@@ -33,22 +33,25 @@ import unittest
 from typing import Literal
 from unittest.mock import Mock, call, patch
 
+from so101_lifecycle import ArmLifecycle
+from so101_mapping import JointTarget
 from so101_teleoperation_validation import (
     HOME,
     JOINTS,
     UNPOWERED_REST,
+    UserAbort,
     approach_and_hold,
     build_pose_preview,
     build_pose_result_record,
     calculate_joint_targets,
     cleanup_connected_arms,
+    connect_and_validate_arms,
     pose_within_tolerance,
+    prepare_follower_at_operational_home,
     record_cleanup_errors,
     target_log_fields,
     write_cycle_rows,
 )
-from so101_lifecycle import ArmLifecycle
-from so101_mapping import JointTarget
 
 
 class MappingAdapterTests(unittest.TestCase):
@@ -426,6 +429,58 @@ class MappingAdapterTests(unittest.TestCase):
         self.assertTrue(
             any("leader" in error for error in errors),
         )
+
+    def test_preflight_rejects_pre_enabled_follower_torque(self) -> None:
+        """Preflight refuses follower torque that this run does not own."""
+        leader_bus = Mock()
+        follower_bus = Mock()
+
+        leader_bus.is_calibrated = True
+        follower_bus.is_calibrated = True
+
+        leader_bus.read.return_value = 0
+        follower_bus.sync_read.return_value = {joint: 0.0 for joint in JOINTS}
+        follower_bus.read.return_value = 1
+
+        leader = ArmLifecycle(name="leader", bus=leader_bus, joints=JOINTS)
+        follower = ArmLifecycle(name="follower", bus=follower_bus, joints=JOINTS)
+
+        with self.assertRaisesRegex(RuntimeError, "already enabled"):
+            connect_and_validate_arms(
+                leader_lifecycle=leader,
+                follower_lifecycle=follower,
+            )
+
+        follower_bus.disable_torque.assert_not_called()
+
+    def test_follower_startup_decline_sends_no_actuator_commands(self) -> None:
+        """Declining startup authorization leaves the follower passive."""
+
+        follower_bus = Mock()
+        follower = Mock()
+
+        follower.bus = follower_bus
+
+        follower_lifecycle = ArmLifecycle(
+            name="follower", bus=follower_bus, joints=JOINTS
+        )
+
+        starting_pose = dict(UNPOWERED_REST)
+
+        with (
+            patch("builtins.input", return_value="STOP"),
+            self.assertRaisesRegex(UserAbort, "declined recognized-rest startup"),
+        ):
+            prepare_follower_at_operational_home(
+                follower=follower,
+                follower_lifecycle=follower_lifecycle,
+                starting_pose=starting_pose,
+                period_s=0.1,
+                max_step=2.0,
+            )
+
+        follower_bus.sync_write.assert_not_called()
+        follower_bus.enable_torque.assert_not_called()
 
 
 if __name__ == "__main__":

@@ -63,6 +63,7 @@ import csv
 import json
 import math
 import time
+from dataclasses import dataclass
 from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
@@ -160,6 +161,23 @@ CSV_FIELDS = (
 
 class UserAbort(RuntimeError):
     """Raised when the operator elects not to continue."""
+
+
+@dataclass(frozen=True)
+class PreflightSnapshot:
+    """Hold the validated follower state captured during connection preflight."""
+
+    follower_present: dict[str, float]
+    follower_torque: dict[str, int]
+
+
+@dataclass(frozen=True)
+class OperationalHomeSnapshot:
+    """Hold the follower command and measurement after startup preparation."""
+
+    commanded: dict[str, float]
+
+    observed: dict[str, float]
 
 
 def utc_now() -> str:
@@ -608,6 +626,87 @@ def parse_args() -> argparse.Namespace:
     return parser.parse_args()
 
 
+def connect_and_validate_arms(
+    *,
+    leader_lifecycle: ArmLifecycle,
+    follower_lifecycle: ArmLifecycle,
+) -> PreflightSnapshot:
+    """Connect both arms and validate the follower's state before teleoperation."""
+
+    leader_bus = leader_lifecycle.bus
+    follower_bus = follower_lifecycle.bus
+
+    leader_bus.connect(handshake=True)
+    follower_bus.connect(handshake=True)
+
+    if not leader_bus.is_calibrated or not follower_bus.is_calibrated:
+        raise RuntimeError("calibration mismatch")
+
+    if any(
+        int(leader_bus.read("Torque_Enable", joint, normalize=False))
+        for joint in leader_lifecycle.joints
+    ):
+        raise RuntimeError("leader must remain passive")
+
+    follower_present = read_positions(follower_bus)
+
+    follower_torque = {
+        joint: int(follower_bus.read("Torque_Enable", joint, normalize=False))
+        for joint in follower_lifecycle.joints
+    }
+
+    if any(follower_torque.values()):
+        raise RuntimeError(
+            "follower torque was already enabled; stop the other controller first"
+        )
+
+    return PreflightSnapshot(
+        follower_present=follower_present,
+        follower_torque=follower_torque,
+    )
+
+
+def prepare_follower_at_operational_home(
+    follower: SO101Follower,
+    follower_lifecycle: ArmLifecycle,
+    starting_pose: dict[str, float],
+    period_s: float,
+    max_step: float,
+) -> OperationalHomeSnapshot:
+    """Authorize and move the follower from its observed pose to operational home."""
+
+    if pose_within_tolerance(starting_pose, UNPOWERED_REST, START_REST_TOLERANCE):
+        answer = (
+            input(
+                "Recognized the known stable unpowered rest pose. Clear the path to "
+                "operational home and type START; anything else aborts.\n"
+            )
+            .strip()
+            .upper()
+        )
+        if answer != "START":
+            raise UserAbort("operator declined recognized-rest startup")
+    else:
+        answer = (
+            input(
+                "Follower is outside the known stable rest pose. Support it and clear "
+                "the path to operational home. Type HOLD to continue; anything else aborts.\n"
+            )
+            .strip()
+            .upper()
+        )
+        if answer != "HOLD":
+            raise UserAbort("operator declined supported startup")
+    follower_lifecycle.align_goals_and_enable_torque(starting_pose)
+    time.sleep(0.4)
+    commanded = move_home(
+        follower, dict(starting_pose), period_s=period_s, max_step=max_step
+    )
+    time.sleep(0.5)
+    observed = read_positions(follower.bus)
+    return OperationalHomeSnapshot(commanded=commanded, observed=observed)
+
+
 def cleanup_connected_arms(
     *,
     leader_lifecycle: ArmLifecycle,
@@ -697,80 +796,39 @@ def run_teleoperation_validation() -> int:
             writer = csv.DictWriter(csv_file, fieldnames=CSV_FIELDS)
             writer.writeheader()
 
-            leader.bus.connect(handshake=True)
-            follower.bus.connect(handshake=True)
-            if not leader.bus.is_calibrated or not follower.bus.is_calibrated:
-                raise RuntimeError("calibration mismatch")
-            if any(
-                int(leader.bus.read("Torque_Enable", joint, normalize=False))
-                for joint in JOINTS
-            ):
-                raise RuntimeError("leader must remain passive")
+            preflight_snapshot = connect_and_validate_arms(
+                leader_lifecycle=leader_lifecycle,
+                follower_lifecycle=follower_lifecycle,
+            )
 
-            present = read_positions(follower.bus)
-            follower_torque = {
-                joint: int(follower.bus.read("Torque_Enable", joint, normalize=False))
-                for joint in JOINTS
-            }
-            if any(follower_torque.values()):
-                raise RuntimeError(
-                    "follower torque was already enabled; stop the other controller first"
-                )
             print(
                 json.dumps(
                     {
                         "stage": "connected_torque_off",
-                        "follower_present": present,
-                        "follower_torque": follower_torque,
+                        "follower_present": preflight_snapshot.follower_present,
+                        "follower_torque": preflight_snapshot.follower_torque,
                     },
                     indent=2,
                 ),
                 flush=True,
             )
-            if pose_within_tolerance(
-                present,
-                UNPOWERED_REST,
-                START_REST_TOLERANCE,
-            ):
-                answer = (
-                    input(
-                        "Recognized the known stable unpowered rest pose. Clear the path to "
-                        "operational home and type START; anything else aborts.\n"
-                    )
-                    .strip()
-                    .upper()
-                )
-                if answer != "START":
-                    raise UserAbort("operator declined recognized-rest startup")
-            else:
-                answer = (
-                    input(
-                        "Follower is outside the known stable rest pose. Support it and clear "
-                        "the path to operational home. Type HOLD to continue; anything else aborts.\n"
-                    )
-                    .strip()
-                    .upper()
-                )
-                if answer != "HOLD":
-                    raise UserAbort("operator declined supported startup")
-            follower_lifecycle.align_goals_and_enable_torque(present)
 
-            time.sleep(0.4)
-            commanded = move_home(
-                follower,
-                dict(present),
+            home_snapshot = prepare_follower_at_operational_home(
+                follower=follower,
+                follower_lifecycle=follower_lifecycle,
+                starting_pose=preflight_snapshot.follower_present,
                 period_s=args.period_s,
                 max_step=args.max_step,
             )
-            time.sleep(0.5)
-            home_observed = read_positions(follower.bus)
-            receipt["home_observed"] = home_observed
+            commanded = home_snapshot.commanded
+            receipt["home_observed"] = home_snapshot.observed
+
             print(
                 json.dumps(
                     {
                         "stage": "home_hold",
                         "home_command": HOME,
-                        "home_observed": home_observed,
+                        "home_observed": home_snapshot.observed,
                     },
                     indent=2,
                 ),
