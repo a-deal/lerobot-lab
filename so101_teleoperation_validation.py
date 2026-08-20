@@ -729,10 +729,21 @@ def run_pose_validation_trial(
 ) -> dict[str, float]:
     """Run one authorized pose trial and return the follower at home."""
     while True:
-        input(
-            f"Move the passive leader to the {pose_name.upper()} collision-safe pose and hold it. "
-            "Press ENTER for a no-motion preview.\n"
+        capture_answer = (
+            input(
+                "The saved leader baseline is the neutral reference. Keep the leader "
+                "at that baseline for zero relative motion, or reposition it to request "
+                f"the {pose_name.upper()} relative pose. Hold it steady, then press ENTER "
+                "for a no-motion preview; type QUIT to shut down.\n"
+            )
+            .strip()
+            .upper()
         )
+        if capture_answer == "QUIT":
+            raise UserAbort("operator ended before all poses")
+        if capture_answer:
+            print("Expected ENTER or QUIT.", flush=True)
+            continue
         leader_captured = read_positions(leader.bus)
         joint_targets = calculate_joint_targets(leader_captured, leader_baseline)
         preview = build_pose_preview(
@@ -979,8 +990,9 @@ def run_teleoperation_validation() -> int:
             )
 
             input(
-                "Place the passive leader in a visually corresponding, collision-safe baseline pose, "
-                "then press ENTER to capture it.\n"
+                "Place the passive leader in a collision-safe pose you can hold steadily, "
+                "then press ENTER to capture it as the neutral reference. Later leader "
+                "changes will request relative follower changes from operational home.\n"
             )
             leader_baseline = read_positions(leader.bus)
             receipt["leader_baseline"] = leader_baseline

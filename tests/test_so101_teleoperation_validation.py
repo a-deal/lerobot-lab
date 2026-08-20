@@ -489,8 +489,51 @@ class MappingAdapterTests(unittest.TestCase):
         follower_bus.sync_write.assert_not_called()
         follower_bus.enable_torque.assert_not_called()
 
-    def test_pose_trial_quit_sends_no_actuator_commands(self) -> None:
-        """Quitting during preview leaves both arms unchanged."""
+    def test_pose_trial_quit_before_capture_reads_no_pose_or_commands(self) -> None:
+        """Quitting at the capture gate exits before observing or moving either arm."""
+
+        leader_bus = Mock()
+        follower_bus = Mock()
+
+        leader = Mock()
+        leader.bus = leader_bus
+
+        follower = Mock()
+        follower.bus = follower_bus
+
+        leader_lifecycle = ArmLifecycle(name="leader", bus=leader_bus, joints=JOINTS)
+        leader_baseline = {joint: 0.0 for joint in JOINTS}
+        pose_results: list[dict[str, object]] = []
+
+        with (
+            patch("builtins.input", return_value="QUIT"),
+            patch("so101_teleoperation_validation.read_positions") as read_positions,
+            self.assertRaisesRegex(UserAbort, "operator ended before all poses"),
+        ):
+            run_pose_validation_trial(
+                pose_name="near",
+                leader=leader,
+                follower=follower,
+                leader_lifecycle=leader_lifecycle,
+                writer=Mock(),
+                flush_cycle_evidence=Mock(),
+                process_start=0.0,
+                commanded=dict(HOME),
+                leader_baseline=leader_baseline,
+                pose_results=pose_results,
+                period_s=0.1,
+                max_step=2.0,
+                hold_s=0.0,
+            )
+
+        read_positions.assert_not_called()
+        leader_bus.sync_write.assert_not_called()
+        leader_bus.enable_torque.assert_not_called()
+        follower_bus.sync_write.assert_not_called()
+        self.assertEqual(pose_results, [])
+
+    def test_pose_trial_quit_after_preview_sends_no_actuator_commands(self) -> None:
+        """Quitting after a safe preview leaves both arms unchanged."""
 
         leader_bus = Mock()
         follower_bus = Mock()
