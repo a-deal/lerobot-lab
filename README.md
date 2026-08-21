@@ -15,10 +15,12 @@ executable entrypoint. `run_so101_teleoperation_validation.py` contains the
 small `main()` for this workflow and can be executed directly.
 `inspect_sample.py` is another standalone script.
 
-`so101_teleoperation_validation.py`, `so101_mapping.py`, and
-`so101_lifecycle.py` are importable library modules. The workflow coordinates
-the validation, the mapper is hardware-free, and the lifecycle module wraps
-one arm's bus to own goal-alignment, torque transitions, and cleanup state.
+`so101_teleoperation_validation.py`, `so101_mapping.py`,
+`so101_pose_gate.py`, `so101_joint_config.py`, and `so101_lifecycle.py` are
+importable library modules. The workflow coordinates validation, the mapper
+and pose evaluator are hardware-free, the joint configuration owns the shared
+six-joint roster, and the lifecycle module wraps one arm's bus to own
+goal-alignment, torque transitions, and cleanup state.
 
 The training workflow begins with `run-first-train.sh`. That file is a shell
 script, not Python. It configures the local environment and calls
@@ -48,6 +50,7 @@ Lane B: SO-101 leader/follower teleoperation validation
 run_so101_teleoperation_validation.py     thin executable entrypoint
   -> calls so101_teleoperation_validation.py
      -> imports so101_mapping.py          pure translation library
+     -> imports so101_joint_config.py     shared six-joint roster
      -> imports so101_lifecycle.py        per-arm torque lifecycle
      -> imports LeRobot SO-101 drivers    hardware communication
   -> reads leader and follower state
@@ -58,6 +61,9 @@ run_so101_teleoperation_validation.py     thin executable entrypoint
 tests/test_so101_mapping.py
   -> proves pure mapping behavior with ordinary numbers
 
+tests/test_so101_pose_gate.py
+  -> proves post-pose measurement and decision behavior without hardware
+
 tests/test_so101_teleoperation_validation.py
   -> proves harness, lifecycle, and cleanup contracts without hardware
 ```
@@ -67,9 +73,10 @@ The dependency direction is deliberate:
 ```text
 thin CLI -> teleoperation workflow -> pure mapping module
                                \-> per-arm lifecycle -> LeRobot bus
-tests    -> public functions in the workflow, lifecycle, and mapper
+pose receipt -> pure pose evaluator -> immutable metrics and decision
+tests    -> public functions in the workflow, lifecycle, mapper, and evaluator
 
-pure mapping module  -X-> lifecycle, hardware, or runner
+pure mapping/evaluator modules  -X-> lifecycle, hardware, or runner
 ```
 
 The mapper must never import lifecycle, the runner, or hardware drivers. The
@@ -101,9 +108,11 @@ the module-level safety boundary and verify the hardware setup first.
   obligations, and independently attempted multi-arm cleanup.
 - Named connection-preflight, authorized follower-startup, and single-pose
   validation phases coordinated by the top-level workflow.
-- Thirty passing SO-101 software-contract tests at the current hardware-free
-  checkpoint: eleven mapper tests and nineteen workflow/lifecycle
-  tests.
+- A pure post-pose evaluator that calculates immutable receipt metrics and
+  applies the predeclared one-pose acceptance policy without touching hardware.
+- Thirty-nine passing SO-101 software-contract tests at the current
+  hardware-free checkpoint: eleven mapper tests, eight pose-gate tests, and
+  twenty workflow/lifecycle tests.
 
 Generated checkpoints, videos, datasets, logs, and local environments are
 deliberately excluded from Git.
@@ -124,11 +133,14 @@ deliberately staged:
    one complete pose-validation trial as named workflow phases.
 8. **Complete:** exercise the complete interactive workflow through a
    hardware-free orchestrator test.
-9. **Pending:** run and evaluate the bounded physical three-pose validation.
+9. **Complete:** calculate and evaluate one completed pose through a pure,
+   hardware-free gate.
+10. **Pending:** run and evaluate the bounded physical three-pose validation.
 
 The current software boundary is stable: the runner orchestrates the session,
-the lifecycle objects own single-arm torque transitions, and the mapper owns
-hardware-free target math.
+the lifecycle objects own single-arm torque transitions, the mapper owns
+hardware-free target math, and the pose gate turns completed receipt evidence
+into immutable metrics and a decision.
 
 ## Pure SO-101 mapping layer
 
@@ -165,6 +177,10 @@ Expect it to be slow on MPS. The point is not a SOTA policy, it's watching loss 
 
 - `so101_mapping.py`: importable pure coordinate-mapping and evaluation
   library; never commands hardware.
+- `so101_joint_config.py`: hardware-free source of truth for joint names and
+  ordering shared by the workflow and evaluator.
+- `so101_pose_gate.py`: pure post-pose metric calculation and one-pose gate
+  policy; never reads receipts or commands hardware.
 - `so101_lifecycle.py`: one arm's goal-alignment ordering, torque transitions,
   and conservative software cleanup obligation.
 - `so101_teleoperation_validation.py`: importable operator-gated validation
@@ -172,6 +188,7 @@ Expect it to be slow on MPS. The point is not a SOTA policy, it's watching loss 
 - `run_so101_teleoperation_validation.py`: thin executable containing `main()`
   and delegating to the importable workflow.
 - `tests/test_so101_mapping.py`: pure mapping unit and six-joint contracts.
+- `tests/test_so101_pose_gate.py`: pure pose-metric and decision contracts.
 - `tests/test_so101_teleoperation_validation.py`: hardware-free runner,
   lifecycle, cleanup, and mapping-integration contracts.
 - `inspect_sample.py`: standalone PushT dataset-inspection entrypoint.
@@ -187,10 +204,15 @@ Expect it to be slow on MPS. The point is not a SOTA policy, it's watching loss 
 3. Read the top of `so101_teleoperation_validation.py` for orchestration flow.
 4. Read `so101_lifecycle.py` for per-arm torque state transitions.
 5. Read the top of `so101_mapping.py` for the pure translator contract.
-6. Read `tests/test_so101_teleoperation_validation.py` for lifecycle, cleanup,
+6. Read `so101_joint_config.py` for the shared six-joint roster.
+7. Read the top of `so101_pose_gate.py` for completed-pose measurement and
+   decision contracts.
+8. Read `tests/test_so101_teleoperation_validation.py` for lifecycle, cleanup,
    and harness handoffs.
-7. Read `tests/test_so101_mapping.py` for the mapper's numerical edge cases.
-8. Use `docs/so101-mapping-learning-guide.md` only when deeper terminology or
+9. Read `tests/test_so101_mapping.py` for the mapper's numerical edge cases.
+10. Read `tests/test_so101_pose_gate.py` for the evaluator's numerical and
+    policy edge cases.
+11. Use `docs/so101-mapping-learning-guide.md` only when deeper terminology or
    historical implementation sequence is useful.
 
 ## Notes
