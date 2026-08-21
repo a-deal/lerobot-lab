@@ -3,7 +3,7 @@
 Where this module sits
 ----------------------
 
-The human moves the passive leader. This module reads that joint configuration,
+The operator moves the passive leader. This module reads that joint configuration,
 asks ``so101_mapping`` for follower targets, previews the proposed movement,
 and moves the powered follower only after explicit operator authorization.
 After capture, the harness aligns and enables leader torque temporarily so the
@@ -75,21 +75,13 @@ from typing import Any
 from lerobot.robots.so101_follower import SO101Follower, SO101FollowerConfig
 from lerobot.teleoperators.so101_leader import SO101Leader, SO101LeaderConfig
 
+from so101_joint_config import JOINTS
 from so101_lifecycle import ArmLifecycle
 from so101_mapping import (
     JointMapping,
     JointTarget,
     final_pose_error,
     map_pose_relative,
-)
-
-JOINTS = (
-    "shoulder_pan",
-    "shoulder_lift",
-    "elbow_flex",
-    "wrist_flex",
-    "wrist_roll",
-    "gripper",
 )
 
 # Operational home proven during the first persistent six-joint run.  This is
