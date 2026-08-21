@@ -1,6 +1,6 @@
 """Pure leader-to-follower coordinate mapping for an SO-101 pair.
 
-Explain it like I am ten: this file is the robot's translator, not its hands.
+This file is the robot's translator, not its hands.
 It receives numbers describing where the leader moved and returns numbers the
 follower could aim for.  A different module owns the dangerous act of sending
 those numbers to motors.

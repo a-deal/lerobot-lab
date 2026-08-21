@@ -65,6 +65,219 @@ the whole function and debugging a pile of failures.
 9. Add at least one independently stated edge-case test before declaring the
    mapper complete.
 
+## Integration exercise: connect the mapper to the hardware harness
+
+### Look-ahead and definition of done
+
+This exercise sits between isolated mapping logic and physical pose-fidelity
+measurement. It does not add a new mapping algorithm or command movement.
+It makes the live harness depend on the already-tested mapper.
+
+The bounded definition of done is:
+
+1. integrate one existing pure module, `so101_mapping.py`, into one existing
+   hardware workflow, `so101_teleoperation_validation.py`;
+2. add one hardware-free adapter test;
+3. keep all eleven pure-mapper tests green;
+4. make the one adapter test green;
+5. pass the harness's existing hardware-free self-test;
+6. preserve all serial, torque, rate-limit, prompt, logging, and shutdown
+   behavior unchanged.
+
+If this turns green, the next stage is a separate refactor that carries
+`JointTarget` objects farther through the harness and removes the temporary
+three-dictionary compatibility layer. Keeping those stages separate tells us
+whether a failure came from connecting the mapper or redesigning consumers.
+
+**Current status:** those consumer migrations are complete. A later bounded
+refactor added `so101_lifecycle.py`, which now owns each arm's goal-alignment
+and torque-cleanup transitions. The sequence below preserves the original
+mapping exercise while the architecture notes describe the current boundary.
+
+### Module and call-chain map
+
+```text
+leader positions captured by the hardware harness
+                    ↓
+calculate_targets adapter in so101_teleoperation_validation.py
+                    ↓
+map_pose_relative in so101_mapping.py
+                    ↓
+dict[joint name, JointTarget]
+                    ↓
+preview, command, logging, and evaluation consumers
+```
+
+`so101_mapping.py` is the translator. It owns validation and target math but
+must remain unable to touch hardware. `so101_lifecycle.py` owns each arm's
+goal-alignment ordering and torque-cleanup obligation.
+`so101_teleoperation_validation.py` conducts the validation. It owns
+hardware reads, command timing, operator gates, multi-arm cleanup, evidence,
+and receipt policy.
+
+### Legacy surface versus new surface
+
+| Surface | Status | Meaning | Removal condition |
+|---|---|---|---|
+| `raw`, `bounded`, `clipped` parallel dictionaries | Removed compatibility layer | Three separately keyed views formerly used by the harness | Removal condition satisfied after every consumer accepted `JointTarget` values directly. |
+| `clipped` boolean name | Removed legacy vocabulary | Former name for whether an absolute bound altered a raw target | Replaced by the mapper's `saturated` field. |
+| `JointMapping` configuration objects | New contract | One named instruction card per joint | Retain unless a later strategy requires a different mapping model. |
+| `JointTarget` result objects | New contract | Raw proposal, allowed value, and saturation evidence kept together | Carry end-to-end through preview, logging, command, and evaluation code. |
+| `map_pose_relative` | New calculation owner | Validates and maps a complete named joint configuration | Retain as the single affine-mapping implementation. |
+
+### Hardware-harness function map
+
+| Entity | Explain it like I am ten | Responsibility |
+|---|---|---|
+| `UserAbort` | A named emergency exit requested by the operator. | Separates intentional human cancellation from unexpected failures. |
+| `utc_now` | Put the current clock time on the receipt. | Supplies comparable wall-clock timestamps. |
+| `read_positions` | Ask all six joints where they are and reject an incomplete answer. | Reads normalized hardware state and validates names and finite values. |
+| harness `clamp` | Take only one small step even when the destination is far away. | Supports command rate limiting; it is separate from target-bound clamping. |
+| `calculate_joint_targets` | Ask the pure translator for one receipt per joint. | Calls `map_pose_relative` and preserves the returned `JointTarget` objects. |
+| `next_commands` | Move each command a little closer to its destination. | Applies the per-cycle maximum-step limit. |
+| `write_cycle_rows` | Write down what every joint was asked to do and what it actually did. | Produces the detailed CSV evidence. |
+| `approach_and_hold` | Walk to the target carefully, stay there briefly, and measure the result. | Owns the control loop, hold window, measurements, and per-pose summary. |
+| `move_home` | Walk the follower back to its known working pose. | Reestablishes the same follower anchor between trials. |
+| `prompt_visual_judgment` | Ask the human whether the physical shapes looked alike. | Captures a manual evaluation label. |
+| `run_self_test` | Rehearse the arithmetic with pretend numbers and no robot. | Provides a quick hardware-free integration smoke test. |
+| `parse_args` | Read the operator's command-line settings. | Builds the runtime configuration. |
+| `ArmLifecycle` | Keep one arm's torque-cleanup sticky note with its bus. | Owns goal alignment, torque transitions, and the conservative cleanup obligation. |
+| `connect_and_validate_arms` | Inspect both arms before allowing the experiment to start. | Connects both buses, verifies calibration and passive torque state, and returns the validated follower snapshot. |
+| `prepare_follower_at_operational_home` | Get permission, power the follower carefully, and move it to the starting line. | Owns startup authorization, goal alignment, torque enablement, rate-limited home movement, and the resulting measurement. |
+| `run_pose_validation_trial` | Preview, authorize, measure, and reset one named pose. | Owns one complete trial while recording its result before leader torque release. |
+| `run_teleoperation_validation` | Conduct the three-phase validation and publish its final receipt. | Orchestrates preflight, startup, three pose trials, top-level status, and shutdown policy. |
+
+### Python execution and exception flow
+
+This harness is synchronous. Its execution model is the same basic model as
+JavaScript's synchronous `try`/`catch`/`finally`: each function call adds a
+frame to a stack of paused callers. A normal return removes the current frame
+and gives a value back to its caller. An exception interrupts the current path
+and searches backward through those callers for a matching handler.
+
+```text
+module entrypoint
+        ↓ calls
+run_teleoperation_validation
+        ├─ connect_and_validate_arms
+        ├─ prepare_follower_at_operational_home
+        ├─ run_pose_validation_trial (once per named pose)
+        └─ finally: cleanup_connected_arms
+                       ↓ calls
+                 ArmLifecycle.disable_torque_if_required
+                       ↓ calls
+                 bus.disable_torque
+
+An uncaught exception travels back up this stack in the opposite direction.
+```
+
+The important Python operations have separate meanings:
+
+| Operation | Meaning |
+|---|---|
+| `raise SomeError(...)` | Start propagating a new exception. |
+| `except SomeError` | Intercept a matching exception at this layer and decide what happens next. |
+| bare `raise` inside `except` | Continue propagating the same exception after recording or adding context. |
+| `finally` | Run this block before leaving the `try`, whether the path succeeds, returns, or propagates an exception. |
+
+Catching an exception does not automatically mean the program failed, and it
+does not automatically mean the program recovered. The handler makes that
+policy decision:
+
+- catch and continue when this layer can restore a valid state or choose a
+  safe fallback;
+- catch and convert the exception into ordinary result data when callers need
+  to inspect a degraded outcome;
+- catch, record, and re-raise when the layer must preserve evidence but cannot
+  safely continue normal work;
+- do not catch when a higher caller is the first layer that can make a useful
+  decision.
+
+`cleanup_connected_arms` uses the second pattern. It asks each connected
+`ArmLifecycle` to discharge its torque obligation, then attempts each
+disconnect. Every arm/action pair has its own exception boundary. A failure
+becomes a labeled string in `cleanup_errors`, and the helper continues trying
+the other independent cleanup actions. This is best-effort continuation, not
+proof that torque was physically disabled or that either arm reached a safe
+pose.
+
+`run_teleoperation_validation` owns the top-level outcome. Its receipt and
+process behavior follow this contract:
+
+| Experiment body | Cleanup | Receipt status | Process behavior |
+|---|---|---|---|
+| completes | succeeds | `completed` | return `0` |
+| completes | reports errors | `cleanup_failed` plus `cleanup_errors` | return `1` |
+| operator abort or handled interrupt | any cleanup result | preserve the earlier status and attach any `cleanup_errors` | return `1` |
+| raises an unexpected `Exception` | any cleanup result | `failed`, original `error`, plus any `cleanup_errors` | write the receipt, then re-raise the original exception |
+
+The unexpected-exception handler in `run_teleoperation_validation` records the primary experiment
+failure and uses bare `raise`. The outer `finally` then runs cleanup and writes
+the receipt before that original exception leaves the function. The cleanup error is
+not hidden: it remains in the receipt as secondary evidence. The compact
+shutdown message prints the final status and receipt path; the receipt file is
+the complete record.
+
+The final success rule is therefore:
+
+```text
+success = experiment completed AND required cleanup reported no errors
+```
+
+When this module is imported by a unit test, Python defines its functions but
+does not run `run_teleoperation_validation` because `__name__ != "__main__"`.
+The cleanup unit test can
+therefore inject failures into mock buses without connecting hardware. Its
+current leader-torque-failure case proves that the expected calls are attempted
+and later disconnect cleanup continues; it does not prove physical shutdown or
+every possible cleanup-failure position.
+
+### Andrew-owned implementation surface
+
+For this exercise Andrew implements only the body of `calculate_targets`.
+The signature and legacy return type stay fixed. The adapter must:
+
+1. call `map_pose_relative` with the captured leader positions, fixed leader
+   baseline, follower `HOME`, and `MAPPING_CONFIGURATION`;
+2. unpack each result's `raw` value into the legacy `raw` dictionary;
+3. unpack each result's `bounded` value into the legacy `bounded` dictionary;
+4. translate each result's `saturated` boolean into the legacy `clipped`
+   dictionary;
+5. return those three dictionaries in their existing order.
+
+### Python concepts practiced by the adapter
+
+- **Import boundary:** the harness imports the pure mapper; the pure mapper
+  never imports the harness. This prevents circular dependencies and keeps
+  hardware out of pure tests.
+- **Dictionary comprehension:** construct one complete keyed result by
+  transforming every `(joint, target)` pair.
+- **Attribute access:** `target.raw`, `target.bounded`, and
+  `target.saturated` read named dataclass fields rather than tuple positions.
+- **Compatibility adapter:** preserve an old interface while delegating its
+  underlying behavior to a new interface.
+- **Single source of truth:** one tested function owns the mapping equation;
+  the harness no longer keeps a second copy that can drift independently.
+
+### Adapter-test path
+
+```text
+test arranges six pretend leader values and six pretend JointTarget receipts
+        ↓
+patch temporarily replaces map_pose_relative with a controllable test double
+        ↓
+test calls the public calculate_targets adapter
+        ↓
+test proves the mapper was called once with the expected inputs
+        ↓
+test proves raw, bounded, and saturated fields reached the correct legacy outputs
+```
+
+The test proves delegation and translation. Combined with the pure mapper
+suite, it proves the tested numerical contract is connected to the harness.
+It does not prove calibration, physical pose correspondence, command timing,
+collision safety, torque behavior, or real leader-follower fidelity.
+
 ## Run the red-to-green testing loop
 
 Run the suite from the repository root:
